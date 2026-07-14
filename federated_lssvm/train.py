@@ -42,6 +42,8 @@ from lssvm.preprocessing import (
     homogeneous_poly_kernel,
     poly_feature_map,
     homogeneous_poly_feature_map,
+    preprocess_features,
+    gcv_gamma,
 )
 from lssvm.plain import predict_lssvm
 from config.metrics import weight_relative_error
@@ -50,19 +52,23 @@ from config.metrics import weight_relative_error
 solv = None
 
 # ── configuration ──────────────────────────────────────────────────
-D_SQRT = 8
-D_INV = 8
+D_SQRT = 2
+D_INV = 2
 D_INV_BACKSUB = 8
-DEPTH_SAFETY = 1.30
+DEPTH_SAFETY = 1.20
 DEPTH_OVERRIDE = None
 N_OVERRIDE = None
-GAMMA = 1.1
+KERNEL_GAMMA = {
+    "linear":    1.1,   # fixed — GCV suboptimal for linearly separable setosa
+    "poly":      1.27,  # GCV overrides at run-time; fallback only
+    "homo_poly": 1.27,
+}
 N_PER_CLASS_BASELINE = (
     2  # used only for the single-client FHE baseline (matches lssvm_cipher.py)
 )
 
 # ── kernel registry (local copy — avoids lssvm_cipher sys.argv side effect) ──
-CLASS_KERNEL_SELECTION = {0: "linear", 1: "homo_poly", 2: "homo_poly"}
+CLASS_KERNEL_SELECTION = {0: "linear", 1: "poly", 2: "poly"}
 _KERNEL_REGISTRY = {
     "linear": (linear_kernel, None, "primal:linear"),
     "poly": (polynomial_kernel, poly_feature_map, "primal:poly:degree=2:c=1.0"),
@@ -254,9 +260,45 @@ def fhe_aggregate(cc, b_cts: list, w_cts: list) -> tuple:
     return b_global, w_global
 
 
+def _report_depth(
+    stage: str,
+    budget: int,
+    ciphertexts: dict[str, object],
+    *,
+    indent: int = 2,
+) -> None:
+    """Print a one-line depth-consumption report for each named ciphertext.
+
+    stage    : label printed before the table (e.g. "client 0 solve", "aggregation")
+    budget   : multiplicative depth the crypto context was created with
+    ciphertexts : {label: ciphertext} — each ct must expose .GetLevel()
+    indent   : leading spaces
+    """
+    pad = " " * indent
+    rows = []
+    for label, ct in ciphertexts.items():
+        consumed = ct.GetLevel()
+        remaining = budget - consumed
+        pct = consumed / budget * 100 if budget > 0 else 0.0
+        rows.append((label, consumed, remaining, pct))
+
+    header = f"{pad}[depth] {stage}  (budget={budget})"
+    col_w = max(len(r[0]) for r in rows) + 2
+    print(header)
+    for label, consumed, remaining, pct in rows:
+        bar_len = 20
+        filled = round(pct / 100 * bar_len)
+        bar = "█" * filled + "░" * (bar_len - filled)
+        print(
+            f"{pad}  {label:<{col_w}} consumed={consumed:3d}  remaining={remaining:3d}"
+            f"  [{bar}] {pct:5.1f}%"
+        )
+
+
 def plaintext_federated_reference(
     partitions_feat: list[tuple[np.ndarray, np.ndarray]],
     X_te_feat: np.ndarray,
+    gamma: float,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Compute FedAvg in plaintext numpy for validation.
 
@@ -265,7 +307,7 @@ def plaintext_federated_reference(
     w_sum = None
     b_sum = 0.0
     for X_c, y_c in partitions_feat:
-        H, rhs = build_lssvm_matrix(X_c, y_c, GAMMA)
+        H, rhs = build_lssvm_matrix(X_c, y_c, gamma)
         try:
             sol = np.linalg.solve(H, rhs)
         except np.linalg.LinAlgError:
@@ -304,11 +346,12 @@ def smoke_test_fedavg() -> None:
 
     X_c1 = rng0.random((2 * n_per_class, n_feat))
     y_c1 = np.array([1.0] * n_per_class + [-1.0] * n_per_class)
-    H1_np, rhs1_np = build_lssvm_matrix(X_c1, y_c1, GAMMA)
+    gamma = KERNEL_GAMMA["linear"]
+    H1_np, rhs1_np = build_lssvm_matrix(X_c1, y_c1, gamma)
 
     X_c2 = rng1.random((2 * n_per_class, n_feat))
     y_c2 = np.array([1.0] * n_per_class + [-1.0] * n_per_class)
-    H2_np, rhs2_np = build_lssvm_matrix(X_c2, y_c2, GAMMA)
+    H2_np, rhs2_np = build_lssvm_matrix(X_c2, y_c2, gamma)
 
     # Plaintext expected averages of FedAvg
     sol1 = np.linalg.solve(H1_np, rhs1_np)
@@ -466,7 +509,7 @@ def main(
     n_test = len(splits[0][1])  # 30
 
     print(f"=== Federated FHE LS-SVM (Iris OvR, k={k} clients) ===")
-    print(f"Dataset: 120 train / {n_test} test  |  GAMMA={GAMMA}")
+    print(f"Dataset: 120 train / {n_test} test  |  KERNEL_GAMMA={KERNEL_GAMMA}")
     print(f"Chebyshev: sqrt={D_SQRT}, inv_qr={D_INV}, inv_backsub={D_INV_BACKSUB}\n")
 
     # Step 1: Compute all partitions (plaintext, no FHE) to determine context size
@@ -574,12 +617,21 @@ def main(
         )
         print(f"--- Class {class_idx} ({name} vs rest) [kernel={kernel_name}] ---")
 
-        # Apply feature map to test set
-        X_te_feat = feature_map(X_te) if feature_map else X_te
-        X_tr_feat = feature_map(X_tr) if feature_map else X_tr
+        # Single per-class preprocessing path shared with the plaintext
+        # reference and inference: linear → raw; poly → map+center+unit-L2 norm.
+        X_tr_feat, phi_mean = preprocess_features(X_tr, feature_map)
+        X_te_feat, _        = preprocess_features(X_te, feature_map, phi_mean=phi_mean)
+
+        # Per-class gamma: GCV for non-linear kernels, fixed fallback for linear
+        if feature_map is not None:
+            gamma, gcv_val = gcv_gamma(X_tr, y_tr, feature_map)
+            print(f"  GCV: γ={gamma:.6f}  GCV={gcv_val:.6f}")
+        else:
+            gamma = KERNEL_GAMMA[kernel_name]
+            print(f"  Linear kernel: fixed γ={gamma:.4f}")
 
         # Full-data plaintext reference
-        H_full, rhs_full = build_lssvm_matrix(X_tr_feat, y_tr, GAMMA)
+        H_full, rhs_full = build_lssvm_matrix(X_tr_feat, y_tr, gamma)
         print(f"  Full-data H={H_full.shape}, cond={np.linalg.cond(H_full):.2f} ...")
         try:
             sol_full = np.linalg.solve(H_full, rhs_full)
@@ -598,7 +650,9 @@ def main(
         if not _class_context_exists(class_dir, depth):
             _save_class_context(class_dir, cc, keys, depth)
         for client_id, (X_c, y_c) in enumerate(parts):
-            X_c_feat = feature_map(X_c) if feature_map else X_c
+            # Each client centers by the shared training mean (phi_mean); unit-L2
+            # normalization is per-row, so client rows match the full-data frame.
+            X_c_feat, _ = preprocess_features(X_c, feature_map, phi_mean=phi_mean)
             parts_feat.append((X_c_feat, y_c))
             ckpt_dir = f"models/k={k}/class_{class_idx}/client_{client_id}"
             if _cts_exist(ckpt_dir):
@@ -609,7 +663,7 @@ def main(
                     print(
                         f"  [client {client_id}] Checkpoint invalid or stale, recomputing"
                     )
-                    H_c, rhs_c = build_lssvm_matrix(X_c_feat, y_c, GAMMA)
+                    H_c, rhs_c = build_lssvm_matrix(X_c_feat, y_c, gamma)
                     print(
                         f"  [client {client_id}] H={H_c.shape}, cond={np.linalg.cond(H_c):.1f} ..."
                     )
@@ -631,7 +685,7 @@ def main(
                     _save_cts(ckpt_dir, cc, keys, b_ct_i, w_ct_i)
                     print(f"  [client {client_id}] Checkpoint refreshed.")
             else:
-                H_c, rhs_c = build_lssvm_matrix(X_c_feat, y_c, GAMMA)
+                H_c, rhs_c = build_lssvm_matrix(X_c_feat, y_c, gamma)
                 print(
                     f"  [client {client_id}] H={H_c.shape}, cond={np.linalg.cond(H_c):.1f} ..."
                 )
@@ -655,17 +709,10 @@ def main(
             b_cts.append(b_ct_i)
             w_cts.append(w_ct_i)
 
-            # DEBUG: decrypt client weights immediately after solve
-            _d = X_te_feat.shape[1]
-            _b_i = solv.decrypt_vector(cc, keys, b_ct_i, 1)[0]
-            _w_i = np.array(solv.decrypt_vector(cc, keys, w_ct_i, _d))
-            _has_nan_b = np.isnan(_b_i)
-            _has_nan_w = np.any(np.isnan(_w_i))
-            print(
-                f"  [DEBUG client {client_id}] b={_b_i:.4f}  "
-                f"w_norm={np.linalg.norm(_w_i):.4f}  "
-                f"NaN: b={_has_nan_b}, w={_has_nan_w}  "
-                f"b_ct.level={b_ct_i.GetLevel()}  w_ct.level={w_ct_i.GetLevel()}"
+            _report_depth(
+                f"client {client_id} solve  (H={X_c_feat.shape[0]+1}×{X_c_feat.shape[0]+1})",
+                depth,
+                {"b_ct": b_ct_i, "w_ct": w_ct_i},
             )
 
         # FHE aggregation
@@ -674,14 +721,11 @@ def main(
         b_global, w_global = fhe_aggregate(cc, b_cts, w_cts)
         print(f"  Aggregation: {time.perf_counter() - t_agg:.3f}s")
 
-        # DEBUG: decrypt aggregated global model
         d = X_te_feat.shape[1]
-        _b_g = solv.decrypt_vector(cc, keys, b_global, 1)[0]
-        _w_g = np.array(solv.decrypt_vector(cc, keys, w_global, d))
-        print(
-            f"  [DEBUG global] b={_b_g:.4f}  w_norm={np.linalg.norm(_w_g):.4f}  "
-            f"NaN: b={np.isnan(_b_g)}, w={np.any(np.isnan(_w_g))}  "
-            f"b_global.level={b_global.GetLevel()}  w_global.level={w_global.GetLevel()}"
+        _report_depth(
+            f"aggregation  (k={k} clients)",
+            depth,
+            {"b_global": b_global, "w_global": w_global},
         )
 
         # Encrypted inference with global model
@@ -689,11 +733,10 @@ def main(
         scores_ct = solv.predict_cipher(cc, keys, b_global, w_global, X_te_feat)
         print(f"  Cipher predict: {time.perf_counter() - t_inf:.4f}s")
         scores_fed = np.array(solv.decrypt_vector(cc, keys, scores_ct, n_test))
-        # DEBUG: raw scores before sign()
-        print(
-            f"  [DEBUG scores] raw={np.round(scores_fed[:6], 4)}  "
-            f"NaN={np.any(np.isnan(scores_fed))}  "
-            f"scores_ct.level={scores_ct.GetLevel()}"
+        _report_depth(
+            f"inference  (n_test={n_test})",
+            depth,
+            {"scores_ct": scores_ct},
         )
         preds_fed = np.sign(scores_fed)
         preds_fed[preds_fed == 0] = 1.0
@@ -703,13 +746,16 @@ def main(
 
         # Plaintext federated reference
         preds_plain_fed, w_plain_fed, _ = plaintext_federated_reference(
-            parts_feat, X_te_feat
+            parts_feat, X_te_feat, gamma
         )
 
-        # Single-client FHE baseline (matches lssvm_cipher.py, N_PER_CLASS=2)
+        # Single-client FHE baseline (matches lssvm_cipher.py, N_PER_CLASS=2).
+        # Standalone client: preprocess with its OWN mean and evaluate on a test
+        # set centered by that same mean, so train/test share one feature frame.
         X_s, y_s = _subsample_for_fhe(X_tr, y_tr, N_PER_CLASS_BASELINE, seed=42)
-        X_s_feat = feature_map(X_s) if feature_map else X_s
-        H_s, rhs_s = build_lssvm_matrix(X_s_feat, y_s, GAMMA)
+        X_s_feat, phi_mean_s = preprocess_features(X_s, feature_map)
+        X_te_feat_s, _ = preprocess_features(X_te, feature_map, phi_mean=phi_mean_s)
+        H_s, rhs_s = build_lssvm_matrix(X_s_feat, y_s, gamma)
         print(f"  Single-client baseline H={H_s.shape} ...")
         t_sc = time.perf_counter()
         b_ct_s, w_ct_s, _ = solv.solver(
@@ -724,7 +770,12 @@ def main(
             D_inv_backsub=D_INV_BACKSUB,
         )
         print(f"  Single-client solve: {time.perf_counter() - t_sc:.1f}s")
-        scores_ct_s = solv.predict_cipher(cc, keys, b_ct_s, w_ct_s, X_te_feat)
+        _report_depth(
+            f"single-client solve  (H={H_s.shape[0]}×{H_s.shape[0]})",
+            depth,
+            {"b_ct": b_ct_s, "w_ct": w_ct_s},
+        )
+        scores_ct_s = solv.predict_cipher(cc, keys, b_ct_s, w_ct_s, X_te_feat_s)
         scores_s = np.array(solv.decrypt_vector(cc, keys, scores_ct_s, n_test))
         preds_single = np.sign(scores_s)
         preds_single[preds_single == 0] = 1.0
@@ -754,6 +805,7 @@ def main(
                 mode_str=mode_str,
                 checkpoint_policy={"persist_public_key": True},
             )
+            np.save(f"{out_dir}/phi_mean.npy", phi_mean)
             print(f"  Global model serialized to {out_dir}/  [{mode_str}]")
 
         # # Delete per-client checkpoints now that aggregation succeeded

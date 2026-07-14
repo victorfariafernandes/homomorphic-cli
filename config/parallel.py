@@ -12,7 +12,7 @@ import os
 import sys
 
 
-DEFAULT_THREADS = int(os.environ.get("FHE_DEFAULT_THREADS", "4"))
+DEFAULT_THREADS = int(os.environ.get("FHE_DEFAULT_THREADS", "6"))
 
 
 def _parse_threads_arg(argv: list[str]) -> tuple[int | None, list[str]]:

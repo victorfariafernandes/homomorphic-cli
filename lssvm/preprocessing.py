@@ -23,6 +23,7 @@ primal-weight computation — no training data needed at inference.
 from __future__ import annotations
 
 import numpy as np
+from math import factorial, sqrt
 from sklearn.datasets import load_iris
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
@@ -62,27 +63,116 @@ def homogeneous_poly_kernel(
 def poly_feature_map(X: np.ndarray, degree: int = 2, c: float = 1.0) -> np.ndarray:
     """Explicit feature map for polynomial kernel (x·y + c)^degree.
 
-    Uses sklearn PolynomialFeatures which scales interaction terms so that
-    φ(x)·φ(y) == (x·y + c)^degree exactly when c=1 (standard normalisation).
-    For c != 1, features are pre-scaled by sqrt(c) for the bias column.
+    Each monomial x^α with |α|=m is scaled by
+        sqrt(degree! * c^(degree-m) / ((degree-m)! * Π αᵢ!))
+    so that φ(x)·φ(y) == (x·y + c)^degree exactly (multinomial theorem).
     Output shape: (N, C(d+degree, degree)).
     """
     from sklearn.preprocessing import PolynomialFeatures
 
-    phi = PolynomialFeatures(degree=degree, include_bias=True).fit_transform(X)
-    if c != 1.0:
-        phi[:, 0] *= np.sqrt(c)  # scale bias term to match (x·y + c)^degree
+    pf = PolynomialFeatures(degree=degree, include_bias=True)
+    phi = pf.fit_transform(X).copy()
+    deg_fact = factorial(degree)
+    for i, powers in enumerate(pf.powers_):
+        m = int(powers.sum())
+        k = degree - m          # how many times c appears in this term
+        denom = factorial(k)
+        for p in powers:
+            denom *= factorial(int(p))
+        phi[:, i] *= sqrt(deg_fact * (c ** k) / denom)
     return phi
 
 
 def homogeneous_poly_feature_map(X: np.ndarray, degree: int = 2) -> np.ndarray:
     """Explicit feature map for homogeneous polynomial kernel (x·y)^degree.
 
-    No bias term. Output shape: (N, C(d+degree-1, degree)).
+    Only degree-exactly monomials are kept. Each x^α is scaled by
+        sqrt(degree! / Π αᵢ!)
+    so that φ(x)·φ(y) == (x·y)^degree exactly (multinomial theorem).
+    Output shape: (N, C(d+degree-1, degree)).
     """
     from sklearn.preprocessing import PolynomialFeatures
 
-    return PolynomialFeatures(degree=degree, include_bias=False).fit_transform(X)
+    pf = PolynomialFeatures(degree=degree, include_bias=False)
+    phi_all = pf.fit_transform(X)
+    mask = pf.powers_.sum(axis=1) == degree
+    phi = phi_all[:, mask].copy()
+    deg_fact = factorial(degree)
+    for i, powers in enumerate(pf.powers_[mask]):
+        denom = 1
+        for p in powers:
+            denom *= factorial(int(p))
+        phi[:, i] *= sqrt(deg_fact / denom)
+    return phi
+
+
+# ── Feature centering and normalization ──────────────────────────
+
+
+def center_features(
+    Phi: np.ndarray,
+    phi_mean: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Center a feature matrix by subtracting the training mean.
+
+    Training mode (phi_mean=None): compute mean from Phi, return (Phi_c, phi_mean).
+    Inference mode (phi_mean given): subtract provided mean, return (Phi_c, phi_mean).
+    phi_mean MUST be fit on training data only — never refit on test data.
+    """
+    if phi_mean is None:
+        phi_mean = Phi.mean(axis=0)
+    return Phi - phi_mean, phi_mean
+
+def normalize_features(Phi: np.ndarray) -> np.ndarray:
+    """Normalize each row to unit L2 norm: φ_n(x) = φ(x) / ‖φ(x)‖.
+
+    Rows with norm < 1e-12 are left unchanged to avoid division by zero.
+    """
+    norms = np.linalg.norm(Phi, axis=1, keepdims=True)
+    norms = np.where(norms < 1e-12, 1.0, norms)
+    return Phi / norms
+
+
+def preprocess_features(
+    X: np.ndarray,
+    feature_map,
+    phi_mean: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-class feature pipeline — identical in plaintext and FHE paths.
+
+    This is the single source of truth for how features enter the KKT system,
+    so that the plaintext reference, the FHE solver, and inference all operate
+    on byte-for-byte the same feature frame.
+
+    Linear kernel (``feature_map is None``): the already-standardized features
+    are used unchanged. Centering is a no-op and unit-L2 normalization is
+    deliberately *skipped* — normalizing the raw 4-D features destroys the
+    linear separability of setosa (drops 100% → 86.7%). ``phi_mean`` is
+    returned as a zero vector so that inference (which subtracts ``phi_mean``)
+    stays a no-op and serialized models remain self-describing.
+
+    Non-linear kernels (explicit ``feature_map``): map → center by the training
+    mean → normalize each row to unit L2 norm. Centering/normalization bounds
+    the KKT entries and narrows the Chebyshev approximation intervals the FHE
+    solver relies on, and lets versicolor/virginica reach ~90% instead of
+    collapsing to the degenerate all-positive classifier.
+
+    Modes
+    -----
+    Training  : pass ``phi_mean=None`` to fit the mean on ``X``.
+    Inference : pass the stored ``phi_mean`` from training.
+
+    Returns ``(X_processed, phi_mean)``.
+    """
+    X = np.asarray(X, dtype=float)
+    if feature_map is None:
+        if phi_mean is None:
+            phi_mean = np.zeros(X.shape[1])
+        return X, phi_mean
+    Phi = feature_map(X)
+    Phi, phi_mean = center_features(Phi, phi_mean=phi_mean)
+    Phi = normalize_features(Phi)
+    return Phi, phi_mean
 
 
 # ── Matrix assembly ───────────────────────────────────────────────
@@ -204,6 +294,48 @@ def prepare_dataset(
         meta = {"y_binary": y_binary, "class_label": f"class {c} vs rest"}
         problems.append((H.tolist(), rhs.tolist(), meta))
     return problems
+
+
+def gcv_gamma(
+    X_tr: np.ndarray,
+    y_tr: np.ndarray,
+    feature_map,
+    bounds: tuple[float, float] = (1e-6, 1e3),
+) -> tuple[float, float]:
+    """GCV-optimal gamma for LSSVM/KRR. Returns (best_gamma, gcv_value).
+
+    One eigendecomposition of K=ΦΦᵀ; GCV(γ) evaluated in O(r) per query.
+    Bias handled by centering labels (ỹ = y − ȳ).
+    Only call for non-linear kernels — GCV finds suboptimal γ for linearly separable data.
+    """
+    from scipy.optimize import minimize_scalar
+
+    Phi = feature_map(X_tr) if feature_map else X_tr
+    Phi, _ = center_features(Phi)
+    Phi = normalize_features(Phi)
+
+    y_c = y_tr - y_tr.mean()
+
+    K = Phi @ Phi.T
+    eigvals, eigvecs = np.linalg.eigh(K)
+    mask = eigvals > 1e-10 * eigvals[-1]
+    lam = eigvals[mask]
+    U   = eigvecs[:, mask]
+
+    u_tilde = U.T @ y_c
+    y_perp_sq = float(y_c @ y_c - u_tilde @ u_tilde)
+    N = len(y_tr)
+
+    def gcv(gamma: float) -> float:
+        gl  = gamma * lam
+        inv = 1.0 / (gl + 1.0)
+        rss = float(np.dot(u_tilde ** 2, inv ** 2)) + y_perp_sq
+        trH_frac = float(np.dot(gl, inv)) / N
+        denom = (1.0 - trH_frac) ** 2
+        return (rss / N) / denom if denom > 1e-12 else 1e12
+
+    result = minimize_scalar(gcv, bounds=bounds, method="bounded")
+    return float(result.x), float(result.fun)
 
 
 if __name__ == "__main__":

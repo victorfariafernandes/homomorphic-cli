@@ -18,12 +18,24 @@ from lssvm.preprocessing import (
     homogeneous_poly_kernel,
     poly_feature_map,
     homogeneous_poly_feature_map,
+    preprocess_features,
+    gcv_gamma,
 )
 from lssvm.plain import predict_lssvm
 
-# Keep same defaults as train.py
-GAMMA = 1.1
-CLASS_KERNEL_SELECTION = {0: "linear", 1: "homo_poly", 2: "homo_poly"}
+# setosa is linearly separable — linear kernel gives 100% binary accuracy at γ=1.1.
+# versicolor/virginica overlap; poly kernel + GCV-tuned γ gives 90% each → 96.67% OvR.
+CLASS_KERNEL_SELECTION = {0: "linear", 1: "poly", 2: "poly"}
+
+# Fallback gamma values (GCV overrides at run-time for poly classes).
+# For linear/setosa: γ=1.1 is manually chosen — GCV minimizes regression loss, not
+# classification accuracy, and finds a suboptimal γ for perfectly separable data.
+KERNEL_GAMMA = {
+    "linear":    1.1,
+    "poly":      1.27,
+    "homo_poly": 1.27,
+}
+
 _KERNEL_REGISTRY = {
     "linear": (linear_kernel, None, "primal:linear"),
     "poly": (polynomial_kernel, poly_feature_map, "primal:poly:degree=2:c=1.0"),
@@ -54,14 +66,14 @@ def partition_all(X: np.ndarray, y: np.ndarray, k: int, base_seed: int = 42):
     return partitions
 
 
-def plaintext_federated_reference(partitions_feat, X_te_feat):
+def plaintext_federated_reference(partitions_feat, X_te_feat, gamma: float):
     """Returns (preds, w_avg, b_avg, client_times_s, inference_time_s)."""
     w_sum = None
     b_sum = 0.0
     client_times = []
     for X_c, y_c in partitions_feat:
         t0 = time.perf_counter()
-        H, rhs = build_lssvm_matrix(X_c, y_c, GAMMA)
+        H, rhs = build_lssvm_matrix(X_c, y_c, gamma)
         try:
             sol = np.linalg.solve(H, rhs)
         except np.linalg.LinAlgError:
@@ -103,13 +115,27 @@ def main(k: int = 3):
         kernel_name, _, feature_map, mode_str = CLASS_KERNELS.get(
             class_idx, ("linear", linear_kernel, None, "primal:linear")
         )
-        X_te_feat = feature_map(X_te) if feature_map else X_te
-        X_tr_feat = feature_map(X_tr) if feature_map else X_tr
+
+        if feature_map is not None:
+            best_gamma, gcv_val = gcv_gamma(X_tr, y_tr, feature_map)
+            print(
+                f"Class {class_idx} ({name}) — GCV: γ={best_gamma:.6f}  GCV={gcv_val:.6f}"
+            )
+        else:
+            best_gamma = KERNEL_GAMMA[kernel_name]
+            print(
+                f"Class {class_idx} ({name}) — linear kernel: using fixed γ={best_gamma:.4f}"
+            )
+        gamma = best_gamma
+        # Single per-class preprocessing path shared with the FHE solver:
+        # linear → raw features; poly → featuremap + center + unit-L2 norm.
+        X_tr_feat, phi_mean = preprocess_features(X_tr, feature_map)
+        X_te_feat, _        = preprocess_features(X_te, feature_map, phi_mean=phi_mean)
 
         t_class_start = time.perf_counter()
 
         # Full-data plaintext reference
-        H_full, rhs_full = build_lssvm_matrix(X_tr_feat, y_tr, GAMMA)
+        H_full, rhs_full = build_lssvm_matrix(X_tr_feat, y_tr, gamma)
         print(f"  Full-data H={H_full.shape}, cond={np.linalg.cond(H_full):.2f} ...")
         try:
             sol_full = np.linalg.solve(H_full, rhs_full)
@@ -124,11 +150,11 @@ def main(k: int = 3):
         parts = partition_all(X_tr_feat, y_tr, k)
         parts_feat = [(Xc, yc) for (Xc, yc) in parts]
         for client_id, (Xc, yc) in enumerate(parts_feat):
-            H_c, rhs_c = build_lssvm_matrix(Xc, yc, GAMMA)
+            H_c, rhs_c = build_lssvm_matrix(Xc, yc, gamma)
             print(f"  [client {client_id}] H={H_c.shape}, cond={np.linalg.cond(H_c):.2f} ...")
 
         preds_plain_fed, w_plain_fed, _, client_times, infer_time = (
-            plaintext_federated_reference(parts_feat, X_te_feat)
+            plaintext_federated_reference(parts_feat, X_te_feat, gamma)
         )
 
         t_class_end = time.perf_counter()

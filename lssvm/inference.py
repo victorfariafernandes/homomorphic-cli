@@ -21,6 +21,8 @@ from lssvm.preprocessing import (
     prepare_iris_binary,
     poly_feature_map,
     homogeneous_poly_feature_map,
+    center_features,
+    normalize_features,
 )
 
 # ── configuration ──────────────────────────────────────────────────
@@ -76,6 +78,11 @@ def run_inference(
 
     # Apply feature map first so we know the mapped dimension for rotation key generation
     X_mapped = _apply_feature_map(X_sample, mode_str)
+    phi_mean = np.load(f"{model_dir}/phi_mean.npy")
+    # Match preprocess_features: linear → raw; non-linear → center + unit-L2 norm.
+    if mode_str.split(":")[1] != "linear":
+        X_mapped, _ = center_features(X_mapped, phi_mean=phi_mean)
+        X_mapped = normalize_features(X_mapped)
     d = X_mapped.shape[1]
 
     cc, keys, b_ct, w_ct, _ = solver_mod.load_model(model_dir, d=d, n_test=1)

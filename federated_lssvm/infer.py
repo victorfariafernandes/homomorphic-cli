@@ -24,12 +24,15 @@ from lssvm.preprocessing import (
     homogeneous_poly_kernel,
     poly_feature_map,
     homogeneous_poly_feature_map,
+    preprocess_features,
 )
 from config.metrics import precision, recall, f1_score, confusion_matrix
 
 solv = None
 
-CLASS_KERNEL_SELECTION = {0: "linear", 1: "homo_poly", 2: "homo_poly"}
+# Must match federated_lssvm.train.CLASS_KERNEL_SELECTION exactly, otherwise
+# inference applies a different feature map than training.
+CLASS_KERNEL_SELECTION = {0: "linear", 1: "poly", 2: "poly"}
 _KERNEL_REGISTRY = {
     "linear": (linear_kernel, None, "primal:linear"),
     "poly": (polynomial_kernel, poly_feature_map, "primal:poly:degree=2:c=1.0"),
@@ -72,10 +75,10 @@ def main(k: int = 20, solver_name: str | None = None) -> None:
         kernel_name, _, feature_map, _ = CLASS_KERNELS.get(
             class_idx, ("linear", linear_kernel, None, "primal:linear")
         )
-        X_te_feat = feature_map(X_te) if feature_map else X_te
-        d = X_te_feat.shape[1]
-
         model_dir = f"models/k={k}/class_{class_idx}"
+        phi_mean = np.load(f"{model_dir}/phi_mean.npy")
+        X_te_feat, _ = preprocess_features(X_te, feature_map, phi_mean=phi_mean)
+        d = X_te_feat.shape[1]
         print(f"--- Class {class_idx} ({name} vs rest) ---")
         print(f"  Loading model from {model_dir}/ ...")
 

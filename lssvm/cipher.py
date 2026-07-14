@@ -28,6 +28,8 @@ from lssvm.preprocessing import (
     homogeneous_poly_kernel,
     poly_feature_map,
     homogeneous_poly_feature_map,
+    center_features,
+    normalize_features,
 )
 from lssvm.plain import predict_lssvm
 from config.metrics import print_class_report
@@ -160,6 +162,10 @@ def main():
         else:
             X_sub_feat = X_sub
             X_te_feat = X_te
+        X_sub_feat, phi_mean = center_features(X_sub_feat)
+        X_te_feat,  _        = center_features(X_te_feat, phi_mean=phi_mean)
+        X_sub_feat = normalize_features(X_sub_feat)
+        X_te_feat  = normalize_features(X_te_feat)
 
         t_mat = time.perf_counter()
         # Build H using linear kernel on mapped features (equivalent to kernel on raw)
@@ -200,6 +206,8 @@ def main():
 
         # ── plaintext reference — full training set ──
         X_tr_feat = feature_map(X_tr) if feature_map is not None else X_tr
+        X_tr_feat, phi_mean_full = center_features(X_tr_feat)
+        X_tr_feat = normalize_features(X_tr_feat)
         H_full_np, rhs_full_np = build_lssvm_matrix(X_tr_feat, y_tr, GAMMA)
         sol_full = np.linalg.solve(H_full_np, rhs_full_np)
         alpha_full = sol_full[1:]
@@ -233,6 +241,7 @@ def main():
         # ── serialize model ──
         out_dir = f"models/class_{class_idx}"
         solv.serialize_model(cc, keys, b_ct, w_ct, out_dir, mode_str=mode_str)
+        np.save(f"{out_dir}/phi_mean.npy", phi_mean)
         print(f"  Model serialized to {out_dir}/  [{mode_str}]")
         print()
 
