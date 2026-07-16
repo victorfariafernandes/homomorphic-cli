@@ -19,6 +19,10 @@ UNSUPPORTED_SOLVERS = {"qr_cell", "qr_householder_cipher_cell"}
 DEFAULT_SOLVER_NAME = "qr_row"
 SOLVER_ENV_VAR = "LSSVM_SOLVER"
 
+SUPPORTED_SECURITY_LEVELS = {"128", "notset"}
+DEFAULT_SECURITY_LEVEL = "128"
+SECURITY_ENV_VAR = "LSSVM_SECURITY"
+
 
 def parse_solver_name(args: list[str], env_var: str = SOLVER_ENV_VAR) -> str:
     """Resolve a solver name from argv-style args and an optional environment override."""
@@ -38,6 +42,27 @@ def parse_solver_name(args: list[str], env_var: str = SOLVER_ENV_VAR) -> str:
     if not solver_name:
         raise ValueError("solver name cannot be empty")
     return solver_name
+
+
+def parse_security_level(args: list[str], env_var: str = SECURITY_ENV_VAR) -> str:
+    """Resolve a security level ("128" or "notset") from argv-style args and env override."""
+    arg_security = None
+    for index, arg in enumerate(args):
+        if arg == "--security":
+            if index + 1 >= len(args):
+                raise ValueError("--security requires a value")
+            arg_security = args[index + 1]
+            break
+        if arg.startswith("--security="):
+            arg_security = arg.split("=", 1)[1]
+            break
+
+    env_security = os.environ.get(env_var)
+    security = (arg_security or env_security or DEFAULT_SECURITY_LEVEL).strip()
+    if security not in SUPPORTED_SECURITY_LEVELS:
+        supported = ", ".join(sorted(SUPPORTED_SECURITY_LEVELS))
+        raise ValueError(f"Unsupported security level '{security}'. Supported: {supported}")
+    return security
 
 
 def resolve_solver_module(solver_name: str):

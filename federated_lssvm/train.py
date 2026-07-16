@@ -30,10 +30,17 @@ from openfhe import (
 
 from federated_lssvm.solver_selection import (
     DEFAULT_SOLVER_NAME,
+    DEFAULT_SECURITY_LEVEL,
     parse_solver_name,
+    parse_security_level,
     resolve_solver_module,
 )
-from lssvm.solvers.utils import depth_for_size
+from lssvm.solvers.utils import (
+    depth_for_size,
+    SPARSE_BOOTSTRAP_SLOTS,
+    write_security_marker,
+    read_security_marker,
+)
 from lssvm.preprocessing import (
     prepare_iris_binary,
     build_lssvm_matrix,
@@ -128,7 +135,7 @@ def _save_cts(out_dir: str, cc, keys, b_ct, w_ct) -> None:
     ), f"Failed to serialize weights to {out_dir}"
 
 
-def _save_class_context(out_dir: str, cc, keys, depth: int) -> None:
+def _save_class_context(out_dir: str, cc, keys, depth: int, security: str = "128") -> None:
     os.makedirs(out_dir, exist_ok=True)
     assert SerializeToFile(
         f"{out_dir}/cryptocontext.bin", cc, BINARY
@@ -142,6 +149,7 @@ def _save_class_context(out_dir: str, cc, keys, depth: int) -> None:
     with open(_class_checkpoint_marker(out_dir), "w", encoding="utf-8") as f:
         f.write(f"schema_version={CLASS_CHECKPOINT_SCHEMA_VERSION}\n")
         f.write(f"depth={depth}\n")
+    write_security_marker(out_dir, security)
 
 
 def _load_class_context(out_dir: str, matrix_size: int, n_test: int, feature_dim: int):
@@ -327,7 +335,7 @@ def plaintext_federated_reference(
     return preds, w_avg, b_avg
 
 
-def smoke_test_fedavg() -> None:
+def smoke_test_fedavg(security: str = DEFAULT_SECURITY_LEVEL) -> None:
     """Validate FedAvg aggregation on two synthetic 7x7 LSSVM systems.
 
     Uses only 7x7 matrices (6 training samples → 7x7 H) to stay within the
@@ -375,10 +383,13 @@ def smoke_test_fedavg() -> None:
         safety_factor=DEPTH_SAFETY,
         depth_override=DEPTH_OVERRIDE,
     )
-    print(f"  Context depth={depth} for 7x7 matrix ...")
+    if security == "128":
+        # The bootstrapping path uses its own fixed budget (see setup_crypto_context).
+        depth = solv._BOOTSTRAP_USABLE_DEPTH + solv._BOOTSTRAP_SKIP_BELOW_LEVEL
+    print(f"  Context depth={depth} for 7x7 matrix (security={security}) ...")
     t0 = time.perf_counter()
     cc, keys = solv.setup_crypto_context(
-        depth, matrix_size=7, n_test=1, feature_dim=n_feat, N=N_OVERRIDE
+        depth, matrix_size=7, n_test=1, feature_dim=n_feat, N=N_OVERRIDE, security=security
     )
     print(f"  Context ready in {time.perf_counter() - t0:.1f}s")
 
@@ -395,6 +406,7 @@ def smoke_test_fedavg() -> None:
         D_sqrt=D_SQRT,
         D_inv=D_INV,
         D_inv_backsub=D_INV_BACKSUB,
+        security=security,
     )
     print(f"  Client 1 done in {time.perf_counter() - t1:.1f}s")
 
@@ -410,6 +422,7 @@ def smoke_test_fedavg() -> None:
         D_sqrt=D_SQRT,
         D_inv=D_INV,
         D_inv_backsub=D_INV_BACKSUB,
+        security=security,
     )
     print(f"  Client 2 done in {time.perf_counter() - t2:.1f}s")
 
@@ -501,9 +514,11 @@ def main(
     serialize: bool = True,
     n_per_class: int | None = None,
     solver_name: str | None = None,
+    security: str = DEFAULT_SECURITY_LEVEL,
 ) -> None:
     global solv
     solv = resolve_solver_module(solver_name or DEFAULT_SOLVER_NAME)
+    slots = SPARSE_BOOTSTRAP_SLOTS if security == "128" else None
 
     splits = prepare_iris_binary()
     n_test = len(splits[0][1])  # 30
@@ -551,6 +566,10 @@ def main(
         # + implicit ModDown(1) + decrypt margin(2)
         + 6
     )
+    if security == "128":
+        # The bootstrapping path ignores the no-bootstrap depth estimate above and uses
+        # its own fixed per-round budget; report/track the depth the context really has.
+        depth = solv._BOOTSTRAP_USABLE_DEPTH + solv._BOOTSTRAP_SKIP_BELOW_LEVEL
     class_dirs = [f"models/k={k}/class_{class_idx}" for class_idx in range(len(splits))]
     existing_ctx_dir = next(
         (
@@ -560,6 +579,7 @@ def main(
             and os.path.exists(f"{class_dir}/public_key.bin")
             and os.path.exists(f"{class_dir}/secret_key.bin")
             and _class_context_exists(class_dir, depth)
+            and read_security_marker(class_dir) == security
         ),
         None,
     )
@@ -571,7 +591,7 @@ def main(
             existing_ctx_dir, max_client_n, n_test, max_feat_dim
         )
     else:
-        print(f"Setting up shared crypto context (depth={depth}) ...")
+        print(f"Setting up shared crypto context (depth={depth}, security={security}) ...")
         t_ctx = time.perf_counter()
         cc, keys = solv.setup_crypto_context(
             depth,
@@ -579,6 +599,7 @@ def main(
             n_test=n_test,
             feature_dim=max_feat_dim,
             N=N_OVERRIDE,
+            security=security,
         )
     slot_count = solv.get_slot_count(cc)
     print(
@@ -598,9 +619,9 @@ def main(
     total_modulus_bits = first_mod_bits + additional_mod_bits
     
     # OpenFHE CKKS defaults from solver setup (fixed across all solvers)
-    security_level = "HEStd_NotSet"
+    security_level = "HEStd_128_classic" if security == "128" else "HEStd_NotSet"
     scaling_factor_bits = 50  # SetScalingModSize(50) in all solvers
-    
+
     print(f"Crypto Context Parameters:")
     print(f"  Security Level: {security_level}")
     print(f"  Ring Dimension: {ring_dim}")
@@ -648,7 +669,7 @@ def main(
         parts_feat = []
         class_dir = f"models/k={k}/class_{class_idx}"
         if not _class_context_exists(class_dir, depth):
-            _save_class_context(class_dir, cc, keys, depth)
+            _save_class_context(class_dir, cc, keys, depth, security=security)
         for client_id, (X_c, y_c) in enumerate(parts):
             # Each client centers by the shared training mean (phi_mean); unit-L2
             # normalization is per-row, so client rows match the full-data frame.
@@ -678,6 +699,7 @@ def main(
                         D_sqrt=D_SQRT,
                         D_inv=D_INV,
                         D_inv_backsub=D_INV_BACKSUB,
+                        security=security,
                     )
                     print(
                         f"  [client {client_id}] FHE solve: {time.perf_counter() - t0:.1f}s"
@@ -700,6 +722,7 @@ def main(
                     D_sqrt=D_SQRT,
                     D_inv=D_INV,
                     D_inv_backsub=D_INV_BACKSUB,
+                    security=security,
                 )
                 print(
                     f"  [client {client_id}] FHE solve: {time.perf_counter() - t0:.1f}s"
@@ -730,7 +753,7 @@ def main(
 
         # Encrypted inference with global model
         t_inf = time.perf_counter()
-        scores_ct = solv.predict_cipher(cc, keys, b_global, w_global, X_te_feat)
+        scores_ct = solv.predict_cipher(cc, keys, b_global, w_global, X_te_feat, slots=slots)
         print(f"  Cipher predict: {time.perf_counter() - t_inf:.4f}s")
         scores_fed = np.array(solv.decrypt_vector(cc, keys, scores_ct, n_test))
         _report_depth(
@@ -768,6 +791,7 @@ def main(
             D_sqrt=D_SQRT,
             D_inv=D_INV,
             D_inv_backsub=D_INV_BACKSUB,
+            security=security,
         )
         print(f"  Single-client solve: {time.perf_counter() - t_sc:.1f}s")
         _report_depth(
@@ -775,7 +799,7 @@ def main(
             depth,
             {"b_ct": b_ct_s, "w_ct": w_ct_s},
         )
-        scores_ct_s = solv.predict_cipher(cc, keys, b_ct_s, w_ct_s, X_te_feat_s)
+        scores_ct_s = solv.predict_cipher(cc, keys, b_ct_s, w_ct_s, X_te_feat_s, slots=slots)
         scores_s = np.array(solv.decrypt_vector(cc, keys, scores_ct_s, n_test))
         preds_single = np.sign(scores_s)
         preds_single[preds_single == 0] = 1.0
@@ -804,6 +828,7 @@ def main(
                 out_dir,
                 mode_str=mode_str,
                 checkpoint_policy={"persist_public_key": True},
+                security=security,
             )
             np.save(f"{out_dir}/phi_mean.npy", phi_mean)
             print(f"  Global model serialized to {out_dir}/  [{mode_str}]")
@@ -849,7 +874,7 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     if "--smoke-test" in args:
         solv = resolve_solver_module(parse_solver_name(args))
-        smoke_test_fedavg()
+        smoke_test_fedavg(security=parse_security_level(args))
         sys.exit(0)
 
     k = 3
@@ -863,4 +888,11 @@ if __name__ == "__main__":
         k = int(numeric_args[0])
 
     solver_name = parse_solver_name(args)
-    main(k=k, serialize=serialize, n_per_class=n_per_class, solver_name=solver_name)
+    security = parse_security_level(args)
+    main(
+        k=k,
+        serialize=serialize,
+        n_per_class=n_per_class,
+        solver_name=solver_name,
+        security=security,
+    )

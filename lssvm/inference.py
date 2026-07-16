@@ -16,7 +16,7 @@ import sys
 import numpy as np
 
 from lssvm.solvers import qr_householder_cipher_row as solver_mod
-from lssvm.solvers.utils import decrypt_vector, sum_slots
+from lssvm.solvers.utils import decrypt_vector, sum_slots, make_packed_plaintext, SPARSE_BOOTSTRAP_SLOTS
 from lssvm.preprocessing import (
     prepare_iris_binary,
     poly_feature_map,
@@ -85,13 +85,13 @@ def run_inference(
         X_mapped = normalize_features(X_mapped)
     d = X_mapped.shape[1]
 
-    cc, keys, b_ct, w_ct, _ = solver_mod.load_model(model_dir, d=d, n_test=1)
+    cc, keys, b_ct, w_ct, _, security = solver_mod.load_model(model_dir, d=d, n_test=1)
 
-    slots = cc.GetRingDimension() // 2
-    e0_ptxt = cc.MakeCKKSPackedPlaintext([1.0] + [0.0] * (slots - 1))
+    slots = SPARSE_BOOTSTRAP_SLOTS if security == "128" else cc.GetRingDimension() // 2
+    e0_ptxt = make_packed_plaintext(cc, [1.0], slots)
 
-    xj = list(X_mapped[0]) + [0.0] * (slots - d)
-    xj_ptxt = cc.MakeCKKSPackedPlaintext(xj)
+    xj = list(X_mapped[0])
+    xj_ptxt = make_packed_plaintext(cc, xj, slots)
 
     dot = cc.EvalMult(w_ct, xj_ptxt)
     score_ct = sum_slots(cc, dot, d)

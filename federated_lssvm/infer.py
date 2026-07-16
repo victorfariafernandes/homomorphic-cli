@@ -26,6 +26,7 @@ from lssvm.preprocessing import (
     homogeneous_poly_feature_map,
     preprocess_features,
 )
+from lssvm.solvers.utils import SPARSE_BOOTSTRAP_SLOTS
 from config.metrics import precision, recall, f1_score, confusion_matrix
 
 solv = None
@@ -82,12 +83,13 @@ def main(k: int = 20, solver_name: str | None = None) -> None:
         print(f"--- Class {class_idx} ({name} vs rest) ---")
         print(f"  Loading model from {model_dir}/ ...")
 
-        cc, keys, b_ct, w_ct, mode_str = solv.load_global_checkpoint(
+        cc, keys, b_ct, w_ct, mode_str, security = solv.load_global_checkpoint(
             model_dir, d=d, n_test=n_test
         )
-        print(f"  Model loaded  [mode={mode_str}]")
+        print(f"  Model loaded  [mode={mode_str}, security={security}]")
 
-        scores_ct = solv.predict_cipher(cc, keys, b_ct, w_ct, X_te_feat)
+        slots = SPARSE_BOOTSTRAP_SLOTS if security == "128" else None
+        scores_ct = solv.predict_cipher(cc, keys, b_ct, w_ct, X_te_feat, slots=slots)
         scores = np.array(solv.decrypt_vector(cc, keys, scores_ct, n_test))
         preds = np.sign(scores)
         preds[preds == 0] = 1.0

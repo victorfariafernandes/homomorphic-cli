@@ -19,7 +19,7 @@ from config.parallel import bootstrap as _init_parallel
 _init_parallel()
 
 
-from lssvm.solvers.utils import depth_for_size
+from lssvm.solvers.utils import depth_for_size, SPARSE_BOOTSTRAP_SLOTS
 from lssvm.preprocessing import (
     prepare_iris_binary,
     build_lssvm_matrix,
@@ -37,6 +37,13 @@ from config.metrics import print_class_report
 solver_name = sys.argv[1] if len(sys.argv) > 1 else "qr_householder_cipher_row"
 solv = importlib.import_module(f"lssvm.solvers.{solver_name}")
 
+# cg_cipher does not support the security="128" bootstrapping path (out of scope for that
+# solver); only the Householder QR solvers do. Fall back to "notset" (its only mode) there.
+_SUPPORTS_BOOTSTRAP_SECURITY = hasattr(solv, "SPARSE_BOOTSTRAP_SLOTS") or solver_name in (
+    "qr_householder_cipher_row",
+    "qr_householder_cipher_col",
+)
+
 # ── configuration ──────────────────────────────────────────────────
 N_PER_CLASS = 2  # samples per binary class → H is (2*N+1) x (2*N+1)
 D_SQRT = 2  # Chebyshev degree for sqrt (QR step)
@@ -46,6 +53,7 @@ DEPTH_SAFETY = 1.15  # calibrated FLEXIBLEAUTO safety factor
 DEPTH_OVERRIDE = None  # set int to bypass estimator during experimentation
 N_OVERRIDE = None  # set int to force ring dimension (None = auto-scale from depth)
 GAMMA = 1.0  # regularisation
+SECURITY = "128" if _SUPPORTS_BOOTSTRAP_SECURITY else "notset"
 
 # ── Kernel selection per OvR class ────────────────────────────────
 # Available options:
@@ -135,11 +143,14 @@ def main():
     )
     print(f"Max feature dim (after kernel map): {max_feat_dim}\n")
 
-    print("Setting up crypto context ...")
+    print(f"Setting up crypto context (security={SECURITY}) ...")
     t_ctx = time.perf_counter()
+    security_kwargs = {"security": SECURITY} if _SUPPORTS_BOOTSTRAP_SECURITY else {}
     cc, keys = solv.setup_crypto_context(
-        depth, matrix_size=n_raw, n_test=n_test, feature_dim=max_feat_dim, N=N_OVERRIDE
+        depth, matrix_size=n_raw, n_test=n_test, feature_dim=max_feat_dim, N=N_OVERRIDE,
+        **security_kwargs,
     )
+    slots = SPARSE_BOOTSTRAP_SLOTS if SECURITY == "128" else None
     slot_count = solv.get_slot_count(cc)
     print(
         f"Context ready in {time.perf_counter() - t_ctx:.1f}s  (slots={slot_count})\n"
@@ -191,6 +202,7 @@ def main():
             D_sqrt=D_SQRT,
             D_inv=D_INV,
             D_inv_backsub=D_INV_BACKSUB,
+            **security_kwargs,
         )
         elapsed = time.perf_counter() - t0
         print(f"  FHE QR solve + primal weights: {elapsed:.1f}s")
@@ -215,7 +227,8 @@ def main():
 
         # ── cipher prediction (primal, no training data needed) ──
         t_cp = time.perf_counter()
-        scores_cipher_ct = solv.predict_cipher(cc, keys, b_ct, w_ct, X_te_feat)
+        predict_kwargs = {"slots": slots} if _SUPPORTS_BOOTSTRAP_SECURITY else {}
+        scores_cipher_ct = solv.predict_cipher(cc, keys, b_ct, w_ct, X_te_feat, **predict_kwargs)
         print(f"  Cipher predict (primal): {time.perf_counter() - t_cp:.4f}s")
         scores_cipher = np.array(
             solv.decrypt_vector(cc, keys, scores_cipher_ct, len(X_te_feat))
@@ -240,7 +253,7 @@ def main():
 
         # ── serialize model ──
         out_dir = f"models/class_{class_idx}"
-        solv.serialize_model(cc, keys, b_ct, w_ct, out_dir, mode_str=mode_str)
+        solv.serialize_model(cc, keys, b_ct, w_ct, out_dir, mode_str=mode_str, **security_kwargs)
         np.save(f"{out_dir}/phi_mean.npy", phi_mean)
         print(f"  Model serialized to {out_dir}/  [{mode_str}]")
         print()

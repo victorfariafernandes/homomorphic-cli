@@ -5,38 +5,102 @@ from __future__ import annotations
 import math
 import random
 
+# Slot width used for every plaintext/ciphertext touched by the bootstrapping
+# (security="128") path. Must be >= the largest rotation index ever used
+# against a bootstrapped ciphertext (n_test=30 for Iris, feature_dim<=15,
+# matrix_size<=7) -- validated empirically (see plan doc): EvalRotate wraps
+# around modulo the ciphertext's bootstrap num_slots with no error, so this
+# must stay >= max(n_test, feature_dim, matrix_size) for every caller.
+SPARSE_BOOTSTRAP_SLOTS = 32
 
-def encrypt_row(cc, keys, row: list):
+
+def make_packed_plaintext(cc, vals: list, slots: int):
+    """Build a CKKS plaintext with explicit slot-count metadata.
+
+    Required whenever the plaintext will be multiplied against a
+    sparse-bootstrapped ciphertext: EvalMult silently returns near-zero
+    garbage (no exception) if the plaintext's `slots` metadata doesn't match
+    the ciphertext's bootstrap num_slots. Passing `slots` explicitly here
+    (rather than relying on the default full-ring-width encoding) is the
+    validated fix.
+    """
+    padded = list(vals) + [0.0] * (slots - len(vals))
+    return cc.MakeCKKSPackedPlaintext(padded, 1, 0, None, slots)
+
+
+def bootstrap_all(cc, cts: list, min_level: int = 0) -> list:
+    """Bootstrap every ciphertext in a list, returning a new list of refreshed ciphertexts.
+
+    min_level: skip ciphertexts below this level. EvalBootstrap silently returns the input
+    unchanged (a no-op, after spending the full bootstrap compute time) whenever the
+    ciphertext isn't depleted past ~bootdepth levels — callers pass their bootdepth here so
+    those provably-pointless calls are skipped entirely.
+    """
+    return [cc.EvalBootstrap(ct) if ct.GetLevel() >= min_level else ct for ct in cts]
+
+
+def write_security_marker(out_dir: str, security: str) -> None:
+    """Persist which security path (security="128"|"notset") produced a checkpoint.
+
+    Needed at load time so predict_cipher is called with the matching `slots` value
+    (SPARSE_BOOTSTRAP_SLOTS for security="128", full ring width otherwise).
+    """
+    with open(f"{out_dir}/security.txt", "w", encoding="utf-8") as f:
+        f.write(security)
+
+
+def read_security_marker(out_dir: str) -> str:
+    """Read the security marker written by write_security_marker.
+
+    Defaults to "notset" for checkpoints created before this marker existed.
+    """
+    import os
+
+    path = f"{out_dir}/security.txt"
+    if not os.path.exists(path):
+        return "notset"
+    with open(path, encoding="utf-8") as f:
+        return f.read().strip()
+
+
+def slots_for_security(cc, security: str) -> int:
+    """Resolve the packing width to use for a given security mode."""
+    return SPARSE_BOOTSTRAP_SLOTS if security == "128" else cc.GetRingDimension() // 2
+
+
+def _resolve_slots(cc, slots: int | None) -> int:
+    return slots if slots is not None else cc.GetRingDimension() // 2
+
+
+def encrypt_row(cc, keys, row: list, slots: int | None = None):
     """Encrypt a single matrix row, zero-padded to fill the slot count."""
-    slots = cc.GetRingDimension() // 2
-    padded = list(row) + [0.0] * (slots - len(row))
-    return cc.Encrypt(keys.publicKey, cc.MakeCKKSPackedPlaintext(padded))
+    slots = _resolve_slots(cc, slots)
+    return cc.Encrypt(keys.publicKey, make_packed_plaintext(cc, row, slots))
 
-def encrypt_matrix_rows(cc, keys, A: list) -> list:
+def encrypt_matrix_rows(cc, keys, A: list, slots: int | None = None) -> list:
     """Encrypt matrix A as a list of row ciphertexts."""
-    return [encrypt_row(cc, keys, row) for row in A]
+    return [encrypt_row(cc, keys, row, slots=slots) for row in A]
 
 
-def encrypt_matrix_cols(cc, keys, A: list) -> list:
+def encrypt_matrix_cols(cc, keys, A: list, slots: int | None = None) -> list:
     """Encrypt m x n matrix A as n column ciphertexts: R_cts[j] = [A[0,j], ..., A[m-1,j], 0, ...]."""
     m, n = len(A), len(A[0])
-    slots = cc.GetRingDimension() // 2
+    slots = _resolve_slots(cc, slots)
     R_cts = []
     for j in range(n):
-        col = [A[i][j] for i in range(m)] + [0.0] * (slots - m)
-        R_cts.append(cc.Encrypt(keys.publicKey, cc.MakeCKKSPackedPlaintext(col)))
+        col = [A[i][j] for i in range(m)]
+        R_cts.append(cc.Encrypt(keys.publicKey, make_packed_plaintext(cc, col, slots)))
     return R_cts
 
 
 
-def encrypt_identity_cols(cc, keys, m: int) -> list:
+def encrypt_identity_cols(cc, keys, m: int, slots: int | None = None) -> list:
     """Encrypt the m x m identity matrix as a list of column ciphertexts."""
-    slots = cc.GetRingDimension() // 2
+    slots = _resolve_slots(cc, slots)
     cols  = []
     for j in range(m):
         col = [1.0 if i == j else 0.0 for i in range(m)]
-        col += [0.0] * (slots - m)
-        cols.append(cc.Encrypt(keys.publicKey, cc.MakeCKKSPackedPlaintext(col)))
+        cols.append(cc.Encrypt(keys.publicKey, make_packed_plaintext(cc, col, slots)))
     return cols
 
 
@@ -242,19 +306,15 @@ def random_matrix(m: int, n: int, seed: int = 42) -> list:
     return [[rng.uniform(0.01, 10.0) for _ in range(n)] for _ in range(m)]
 
 
-def he_matmul_T_vec(cc, Q_cols: list, rhs: list, m: int, n: int):
+def he_matmul_T_vec(cc, Q_cols: list, rhs: list, m: int, n: int, slots: int | None = None):
     """Compute c = Q^T @ rhs homomorphically. Q_cols encrypted, rhs plaintext.
 
     Returns a single ciphertext with c[j] in slot j (j = 0..n-1).
     Depth cost: +2 levels beyond Q_cols depth.
     """
-    slots = cc.GetRingDimension() // 2
-    rhs_padded = list(rhs) + [0.0] * (slots - len(rhs))
-    rhs_ptxt = cc.MakeCKKSPackedPlaintext(rhs_padded)
-
-    e0_vec = [0.0] * slots
-    e0_vec[0] = 1.0
-    e0_ptxt = cc.MakeCKKSPackedPlaintext(e0_vec)
+    slots = _resolve_slots(cc, slots)
+    rhs_ptxt = make_packed_plaintext(cc, rhs, slots)
+    e0_ptxt = make_packed_plaintext(cc, [1.0], slots)
 
     c_ct = None
     for j in range(n):
@@ -269,7 +329,9 @@ def he_matmul_T_vec(cc, Q_cols: list, rhs: list, m: int, n: int):
 
 
 def he_back_substitute(cc, keys, R_cts: list, c_ct, n: int,
-                       diag_bounds: list, D_inv: int = 64):
+                       diag_bounds: list, D_inv: int = 64,
+                       slots: int | None = None, bootstrap: bool = False,
+                       bootstrap_min_level: int = 0):
     """Solve upper-triangular Rx = c homomorphically with encrypted pivot inversion.
 
     R_cts:      row-packed encrypted R (m ciphertexts).
@@ -277,23 +339,24 @@ def he_back_substitute(cc, keys, R_cts: list, c_ct, n: int,
     n:          number of unknowns (columns of R).
     diag_bounds: list of tuples [(lo_i, hi_i), ...] for encrypted diagonal bounds.
     D_inv:      Chebyshev degree for encrypted reciprocal approximation.
+    bootstrap:  if True, refresh x_ct and R_cts[i] each row (security="128" path).
+    bootstrap_min_level: skip bootstraps below this level (see bootstrap_all).
 
     Returns ciphertext with x[j] in slot j. Depth cost: ~2*n + n*2*ceil(log2(D_inv+1)) levels.
     """
     if diag_bounds is None or len(diag_bounds) < n:
         raise ValueError("diag_bounds must provide one (lo, hi) pair per unknown for encrypted pivot inversion")
 
-    slots = cc.GetRingDimension() // 2
-
-    e0_vec = [0.0] * slots
-    e0_vec[0] = 1.0
-    e0_ptxt = cc.MakeCKKSPackedPlaintext(e0_vec)
+    slots = _resolve_slots(cc, slots)
+    e0_ptxt = make_packed_plaintext(cc, [1.0], slots)
 
     # Start with x = 0 (encrypted)
-    x_ct = cc.Encrypt(keys.publicKey,
-                      cc.MakeCKKSPackedPlaintext([0.0] * slots))
+    x_ct = cc.Encrypt(keys.publicKey, make_packed_plaintext(cc, [], slots))
 
     for i in range(n - 1, -1, -1):
+        if bootstrap and R_cts[i].GetLevel() >= bootstrap_min_level:
+            R_cts[i] = cc.EvalBootstrap(R_cts[i])
+
         # 1. Inner product: sum_{j>i} R[i][j] * x[j]
         if i < n - 1:
             # R_cts[i] has row i in slots 0..n-1; x_ct has solution so far
@@ -336,10 +399,13 @@ def he_back_substitute(cc, keys, R_cts: list, c_ct, n: int,
             x_i = safe_rotate(cc, x_i, -i)
         x_ct = cc.EvalAdd(x_ct, x_i)
 
+        if bootstrap and x_ct.GetLevel() >= bootstrap_min_level:
+            x_ct = cc.EvalBootstrap(x_ct)
+
     return x_ct
 
 
-def he_primal_weights(cc, x_ct, X_train, y_train):
+def he_primal_weights(cc, x_ct, X_train, y_train, slots: int | None = None):
     """Compute primal weight vector w = Σᵢ αᵢ·yᵢ·x_train_i inside FHE.
 
     x_ct:    encrypted [b, α₀, ..., α_{n-1}] with b in slot 0, αᵢ in slot i+1.
@@ -349,13 +415,11 @@ def he_primal_weights(cc, x_ct, X_train, y_train):
     Returns w_ct: encrypted d-dimensional weight vector in slots 0..d-1.
     Depth cost: +2 levels (extract αᵢ + multiply by plaintext row).
     """
-    slots = cc.GetRingDimension() // 2
+    slots = _resolve_slots(cc, slots)
     n_train = len(X_train)
     d = len(X_train[0])
 
-    e0_vec = [0.0] * slots
-    e0_vec[0] = 1.0
-    e0_ptxt = cc.MakeCKKSPackedPlaintext(e0_vec)
+    e0_ptxt = make_packed_plaintext(cc, [1.0], slots)
 
     w_ct = None
     for i in range(n_train):
@@ -364,8 +428,8 @@ def he_primal_weights(cc, x_ct, X_train, y_train):
         alpha_i_bc = replicate_slot_0(cc, alpha_i_ct, d)                  # depth +0
 
         # Plaintext scaled training row: yᵢ · x_train_i
-        sv = [float(y_train[i] * X_train[i][k]) for k in range(d)] + [0.0] * (slots - d)
-        sv_ptxt = cc.MakeCKKSPackedPlaintext(sv)
+        sv = [float(y_train[i] * X_train[i][k]) for k in range(d)]
+        sv_ptxt = make_packed_plaintext(cc, sv, slots)
 
         term = cc.EvalMult(alpha_i_bc, sv_ptxt)                           # depth +1
         w_ct = term if w_ct is None else cc.EvalAdd(w_ct, term)

@@ -23,6 +23,8 @@ from .utils import (
     sum_slots,
     replicate_slot_0,
     he_primal_weights,
+    write_security_marker,
+    read_security_marker,
 )
 
 
@@ -56,9 +58,19 @@ def _rotation_indices(matrix_size, n_test=None, feature_dim=None):
     return sorted(set(pos + neg + pos_pow2 + neg_pow2 + feat_pow2))
 
 
+def _reject_bootstrap_security(security):
+    if security == "128":
+        raise ValueError(
+            "cg_cipher does not support the security='128' bootstrapping path; "
+            "use --solver=qr_row (or qr_col) or --security=notset"
+        )
+
+
 def setup_crypto_context(
-    mult_depth, N=None, matrix_size=None, n_test=None, feature_dim=None
+    mult_depth, N=None, matrix_size=None, n_test=None, feature_dim=None,
+    security="notset",
 ):
+    _reject_bootstrap_security(security)
     if N is None:
         total_mod_bits = 60 + mult_depth * 50
         N_min = 2 * total_mod_bits
@@ -290,7 +302,9 @@ def save_global_checkpoint(
     mode_str,
     checkpoint_policy,
     fmt=BINARY,
+    security="notset",
 ):
+    _reject_bootstrap_security(security)
     policy = dict(checkpoint_policy or {})
     persist_public_key = bool(policy.get("persist_public_key", False))
 
@@ -308,6 +322,7 @@ def save_global_checkpoint(
 
     with open(f"{out_dir}/mode.txt", "w", encoding="utf-8") as f:
         f.write(mode_str)
+    write_security_marker(out_dir, security)
 
     _write_checkpoint_metadata(out_dir, mode_str, policy, fmt, persist_public_key)
 
@@ -355,6 +370,7 @@ def load_global_checkpoint(out_dir, d, n_test=None, checkpoint_policy=None, fmt=
 
     with open(f"{out_dir}/mode.txt", encoding="utf-8") as f:
         mode_str = f.read().strip()
+    security = read_security_marker(out_dir)
 
     cc.EvalMultKeyGen(sk)
     cc.EvalRotateKeyGen(sk, _rotation_indices(d, n_test))
@@ -365,11 +381,12 @@ def load_global_checkpoint(out_dir, d, n_test=None, checkpoint_policy=None, fmt=
     keys = _K()
     keys.publicKey = pk
     keys.secretKey = sk
-    return cc, keys, b_ct, w_ct, mode_str
+    return cc, keys, b_ct, w_ct, mode_str, security
 
 
 def serialize_model(
-    cc, keys, b_ct, w_ct, out_dir, mode_str="primal:linear", fmt=BINARY
+    cc, keys, b_ct, w_ct, out_dir, mode_str="primal:linear", fmt=BINARY,
+    security="notset",
 ):
     save_global_checkpoint(
         cc,
@@ -380,6 +397,7 @@ def serialize_model(
         mode_str,
         checkpoint_policy={"persist_public_key": True},
         fmt=fmt,
+        security=security,
     )
 
 
@@ -442,7 +460,8 @@ def he_primal_weights_from_alpha(cc, alpha_ct, X_train, y_train):
     return w_ct
 
 
-def solver(cc, keys, H, rhs, X_train, y_train, D_sqrt=64, D_inv=64, D_inv_backsub=64):
+def solver(cc, keys, H, rhs, X_train, y_train, D_sqrt=64, D_inv=64, D_inv_backsub=64,
+           security="notset"):
     """Solve LSSVM saddle-point system via Schur reduction + CG.
 
     LSSVM H = [[0, 1ᵀ], [1, K_aug]] is symmetric INDEFINITE. CG fails directly.
@@ -454,6 +473,7 @@ def solver(cc, keys, H, rhs, X_train, y_train, D_sqrt=64, D_inv=64, D_inv_backsu
     Falls back to direct CG when H[0][0] != 0.
     Returns (b_ct, w_ct, n).
     """
+    _reject_bootstrap_security(security)
     slots = cc.GetRingDimension() // 2
     n = len(H)
     e0_ptxt = cc.MakeCKKSPackedPlaintext([1.0] + [0.0] * (slots - 1))
@@ -534,8 +554,8 @@ def get_slot_count(cc):
     return cc.GetRingDimension() // 2
 
 
-def predict_cipher(cc, keys, b_ct, w_ct, X_test):
-    slots = cc.GetRingDimension() // 2
+def predict_cipher(cc, keys, b_ct, w_ct, X_test, slots=None):
+    slots = slots if slots is not None else cc.GetRingDimension() // 2
     n_test, d = X_test.shape
     e0_ptxt = cc.MakeCKKSPackedPlaintext([1.0] + [0.0] * (slots - 1))
 

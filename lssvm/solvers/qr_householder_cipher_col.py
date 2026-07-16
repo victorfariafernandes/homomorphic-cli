@@ -27,6 +27,25 @@ from .utils import (
     he_matmul_T_vec,
     he_back_substitute,
     he_primal_weights,
+    make_packed_plaintext,
+    bootstrap_all,
+    SPARSE_BOOTSTRAP_SLOTS,
+    write_security_marker,
+    read_security_marker,
+    slots_for_security,
+)
+
+# Bootstrap CoeffToSlot/SlotToCoeff level budget. MUST stay small enough for the sparse
+# 32-slot packing: with log2(32)=5 rotation stages, a (4,4) budget over-factorizes the
+# homomorphic FFT and OpenFHE silently returns garbage from every genuinely-executing
+# bootstrap (no exception). (3,2) validated at N=131072/HEStd_128_classic: max_rel_err
+# 8.8e-3 per genuine bootstrap. usable=25, bootdepth=19, total depth=44.
+_BOOTSTRAP_LEVEL_BUDGET = (3, 2)
+_BOOTSTRAP_USABLE_DEPTH = 25
+# EvalBootstrap silently returns the input unchanged (after full compute cost) when the
+# ciphertext isn't depleted past ~bootdepth levels; skip those calls entirely.
+_BOOTSTRAP_SKIP_BELOW_LEVEL = FHECKKSRNS.GetBootstrapDepth(
+    _BOOTSTRAP_LEVEL_BUDGET, SecretKeyDist.UNIFORM_TERNARY
 )
 
 
@@ -73,13 +92,53 @@ def setup_crypto_context(
     matrix_size: int = None,
     n_test: int = None,
     feature_dim: int = None,
+    security: str = "128",
 ) -> Tuple:
     """CKKS context with targeted rotation keys for the active matrix and test sizes.
 
     feature_dim: maximum feature dimension after any kernel feature map.  Pass the
                  largest d across all OvR classifiers so sum_slots has the needed keys.
-    Ring dimension N is auto-scaled from mult_depth if not provided.
+    security:    "128" (default) -- standardized HEStd_128_classic security via periodic
+                 bootstrapping (N auto-selects to 131072 at the validated depth budget).
+                 "notset" -- legacy fast/insecure path (HEStd_NotSet, no bootstrapping),
+                 kept only for quick local iteration. Ring dimension N is auto-scaled
+                 from mult_depth in that path if not provided.
     """
+    if security == "128":
+        skd = SecretKeyDist.UNIFORM_TERNARY
+        # Ignore the caller's mult_depth: it is the NO-bootstrap circuit's full depth
+        # estimate (e.g. 96-161+ for a 7x7 solve). The bootstrapping path refreshes
+        # ciphertexts every round, so only the validated per-round budget is needed --
+        # using the caller's value would explode N (and key sizes) for nothing.
+        usable = _BOOTSTRAP_USABLE_DEPTH
+        bootdepth = FHECKKSRNS.GetBootstrapDepth(_BOOTSTRAP_LEVEL_BUDGET, skd)
+        depth = usable + bootdepth
+
+        params = CCParamsCKKSRNS()
+        params.SetSecretKeyDist(skd)
+        params.SetSecurityLevel(SecurityLevel.HEStd_128_classic)
+        params.SetScalingModSize(50)
+        params.SetFirstModSize(60)
+        params.SetScalingTechnique(ScalingTechnique.FLEXIBLEAUTO)
+        params.SetMultiplicativeDepth(depth)
+
+        cc = GenCryptoContext(params)
+        cc.Enable(PKESchemeFeature.PKE)
+        cc.Enable(PKESchemeFeature.KEYSWITCH)
+        cc.Enable(PKESchemeFeature.LEVELEDSHE)
+        cc.Enable(PKESchemeFeature.ADVANCEDSHE)
+        cc.Enable(PKESchemeFeature.FHE)
+
+        keys = cc.KeyGen()
+        cc.EvalMultKeyGen(keys.secretKey)
+        cc.EvalBootstrapSetup(_BOOTSTRAP_LEVEL_BUDGET, [0, 0], SPARSE_BOOTSTRAP_SLOTS)
+        cc.EvalBootstrapKeyGen(keys.secretKey, SPARSE_BOOTSTRAP_SLOTS)
+
+        rot_indices = _rotation_indices(matrix_size, n_test, feature_dim=feature_dim)
+        cc.EvalRotateKeyGen(keys.secretKey, rot_indices)
+
+        return cc, keys
+
     if N is None:
         total_mod_bits = 60 + mult_depth * 50
         N_min = 2 * total_mod_bits
@@ -125,22 +184,21 @@ def householder_step_fhe_col(
     vtv_hi: float,
     D_sqrt: int = 16,
     D_inv: int = 16,
+    slots: int = None,
+    bootstrap: bool = False,
 ):
     """One Householder reflection at pivot k with column-packed R (sign=+1, zero decryptions).
 
-    Updates R_cts and Q_cols in-place.
+    Updates R_cts and Q_cols in-place. If bootstrap=True, every ciphertext in R_cts and
+    Q_cols is refreshed via EvalBootstrap after the step (security="128" path).
     """
-    slots = cc.GetRingDimension() // 2
+    slots = slots if slots is not None else cc.GetRingDimension() // 2
     length = m - k
 
-    mask_k_vec = [0.0] * slots
-    for i in range(k, m):
-        mask_k_vec[i] = 1.0
-    mask_k = cc.MakeCKKSPackedPlaintext(mask_k_vec)
+    mask_k_vec = [1.0 if k <= i < m else 0.0 for i in range(min(m, slots))]
+    mask_k = make_packed_plaintext(cc, mask_k_vec, slots)
 
-    e_0_vec = [0.0] * slots
-    e_0_vec[0] = 1.0
-    ptxt_e0 = cc.MakeCKKSPackedPlaintext(e_0_vec)
+    ptxt_e0 = make_packed_plaintext(cc, [1.0], slots)
 
     x_ct = cc.EvalMult(R_cts[k], mask_k)
 
@@ -191,6 +249,10 @@ def householder_step_fhe_col(
     del v_bc, tau_bc, tau_v_ct, v_ct, d_ct
     gc.collect()
 
+    if bootstrap:
+        R_cts[:] = bootstrap_all(cc, R_cts, min_level=_BOOTSTRAP_SKIP_BELOW_LEVEL)
+        Q_cols[:] = bootstrap_all(cc, Q_cols, min_level=_BOOTSTRAP_SKIP_BELOW_LEVEL)
+
 
 def _qr(
     cc,
@@ -199,12 +261,14 @@ def _qr(
     D_sqrt: int = 64,
     D_inv: int = 64,
     diag_bounds: list = None,
+    slots: int = None,
+    bootstrap: bool = False,
 ) -> Tuple[list, list, list]:
     """Column-packed Householder QR (internal). Returns (Q_cols, R_cts, diag_bounds)."""
     m, n = len(A), len(A[0])
 
-    R_cts = encrypt_matrix_cols(cc, keys, A)
-    Q_cols = encrypt_identity_cols(cc, keys, m)
+    R_cts = encrypt_matrix_cols(cc, keys, A, slots=slots)
+    Q_cols = encrypt_identity_cols(cc, keys, m, slots=slots)
 
     step_norms = simulate_norms(A)
     diag_bounds = simulate_diag_bounds(A, diag_bounds=diag_bounds)
@@ -226,6 +290,8 @@ def _qr(
             vtv_hi=vt * margin,
             D_sqrt=D_sqrt,
             D_inv=D_inv,
+            slots=slots,
+            bootstrap=bootstrap,
         )
 
     return Q_cols, R_cts, diag_bounds
@@ -241,8 +307,13 @@ def solver(
     D_sqrt: int = 64,
     D_inv: int = 64,
     D_inv_backsub: int = 64,
+    security: str = "128",
 ) -> Tuple:
     """Solve H @ x = rhs fully in FHE using column-packed QR, then compute primal weights.
+
+    security: "128" bootstraps every ciphertext each step at SPARSE_BOOTSTRAP_SLOTS width
+              (must match the crypto context's setup_crypto_context(security="128") call).
+              "notset" preserves the original full-width, no-bootstrap behavior.
 
     Returns (b_ct, w_ct, n):
       b_ct — encrypted bias scalar in slot 0.
@@ -250,23 +321,29 @@ def solver(
       n    — solution size (n_train + 1).
     """
     m, n = len(H), len(H[0])
-    slots = cc.GetRingDimension() // 2
+    bootstrap = security == "128"
+    slots = SPARSE_BOOTSTRAP_SLOTS if bootstrap else cc.GetRingDimension() // 2
 
-    Q_cols, R_cts, diag_bounds = _qr(cc, keys, H, D_sqrt=D_sqrt, D_inv=D_inv)
-    c_ct = he_matmul_T_vec(cc, Q_cols, rhs, m, n)
+    Q_cols, R_cts, diag_bounds = _qr(
+        cc, keys, H, D_sqrt=D_sqrt, D_inv=D_inv, slots=slots, bootstrap=bootstrap
+    )
+    c_ct = he_matmul_T_vec(cc, Q_cols, rhs, m, n, slots=slots)
     x_ct = he_back_substitute(
-        cc, keys, R_cts, c_ct, n, diag_bounds=diag_bounds, D_inv=D_inv_backsub
+        cc, keys, R_cts, c_ct, n, diag_bounds=diag_bounds, D_inv=D_inv_backsub,
+        slots=slots, bootstrap=bootstrap,
+        bootstrap_min_level=_BOOTSTRAP_SKIP_BELOW_LEVEL,
     )
 
-    e0_ptxt = cc.MakeCKKSPackedPlaintext([1.0] + [0.0] * (slots - 1))
+    e0_ptxt = make_packed_plaintext(cc, [1.0], slots)
     b_ct = cc.EvalMult(x_ct, e0_ptxt)
-    w_ct = he_primal_weights(cc, x_ct, X_train, y_train)
+    w_ct = he_primal_weights(cc, x_ct, X_train, y_train, slots=slots)
 
     return b_ct, w_ct, n
 
 
 def serialize_model(
-    cc, keys, b_ct, w_ct, out_dir: str, mode_str: str = "primal:linear", fmt=BINARY
+    cc, keys, b_ct, w_ct, out_dir: str, mode_str: str = "primal:linear", fmt=BINARY,
+    security: str = "128",
 ) -> None:
     """Serialize crypto context, public/secret keys, bias, primal weights, and mode to out_dir.
 
@@ -293,6 +370,7 @@ def serialize_model(
     ), "Failed to serialize weight ciphertext"
     with open(f"{out_dir}/mode.txt", "w") as f:
         f.write(mode_str)
+    write_security_marker(out_dir, security)
 
 
 def load_model(out_dir: str, d: int, n_test: int = None, fmt=BINARY):
@@ -301,7 +379,7 @@ def load_model(out_dir: str, d: int, n_test: int = None, fmt=BINARY):
     d:       feature dimension (used to size rotation keys).
     n_test:  number of test samples (used to size negative rotation keys).
 
-    Returns (cc, keys, b_ct, w_ct, mode_str).
+    Returns (cc, keys, b_ct, w_ct, mode_str, security).
     """
     cc, ok = DeserializeCryptoContext(f"{out_dir}/cryptocontext.bin", fmt)
     assert ok, f"Failed to deserialize crypto context from {out_dir}"
@@ -320,6 +398,7 @@ def load_model(out_dir: str, d: int, n_test: int = None, fmt=BINARY):
 
     with open(f"{out_dir}/mode.txt") as f:
         mode_str = f.read().strip()
+    security = read_security_marker(out_dir)
 
     cc.EvalMultKeyGen(sk)
     rot_indices = _rotation_indices(d, n_test)
@@ -332,7 +411,7 @@ def load_model(out_dir: str, d: int, n_test: int = None, fmt=BINARY):
     keys.publicKey = pk
     keys.secretKey = sk
 
-    return cc, keys, b_ct, w_ct, mode_str
+    return cc, keys, b_ct, w_ct, mode_str, security
 
 
 def transpose(a: list) -> list:
@@ -423,6 +502,7 @@ def save_global_checkpoint(
     mode_str: str,
     checkpoint_policy,
     fmt=BINARY,
+    security: str = "128",
 ) -> None:
     import os as _os
 
@@ -453,6 +533,7 @@ def save_global_checkpoint(
 
     with open(f"{out_dir}/mode.txt", "w", encoding="utf-8") as f:
         f.write(mode_str)
+    write_security_marker(out_dir, security)
 
     _write_checkpoint_metadata(out_dir, mode_str, policy, fmt, persist_public_key)
 
@@ -511,6 +592,7 @@ def load_global_checkpoint(
 
     with open(f"{out_dir}/mode.txt", encoding="utf-8") as f:
         mode_str = f.read().strip()
+    security = read_security_marker(out_dir)
 
     cc.EvalMultKeyGen(sk)
     rot_indices = _rotation_indices(d, n_test)
@@ -523,7 +605,7 @@ def load_global_checkpoint(
     keys.publicKey = pk
     keys.secretKey = sk
 
-    return cc, keys, b_ct, w_ct, mode_str
+    return cc, keys, b_ct, w_ct, mode_str, security
 
 
 def decrypt_vector(cc, keys, ct, length: int) -> list:
@@ -538,18 +620,24 @@ def get_slot_count(cc) -> int:
     return cc.GetRingDimension() // 2
 
 
-def predict_cipher(cc, keys, b_ct, w_ct, X_test):
-    """Score test samples using encrypted primal weights (compatible with lssvm_cipher.py)."""
+def predict_cipher(cc, keys, b_ct, w_ct, X_test, slots: int = None):
+    """Score test samples using encrypted primal weights (compatible with lssvm_cipher.py).
+
+    slots: must be SPARSE_BOOTSTRAP_SLOTS when b_ct/w_ct came from a security="128" solve
+           (bootstrapped ciphertexts) -- see make_packed_plaintext's docstring for why an
+           explicit, matching slots value is required. Defaults to full ring width for
+           legacy/"notset" models.
+    """
     from .utils import sum_slots, safe_rotate
 
-    slots = cc.GetRingDimension() // 2
+    slots = slots if slots is not None else cc.GetRingDimension() // 2
     n_test, d = X_test.shape
-    e0_ptxt = cc.MakeCKKSPackedPlaintext([1.0] + [0.0] * (slots - 1))
+    e0_ptxt = make_packed_plaintext(cc, [1.0], slots)
 
     scores_ct = None
     for j in range(n_test):
-        xj = list(X_test[j]) + [0.0] * (slots - d)
-        xj_ptxt = cc.MakeCKKSPackedPlaintext(xj)
+        xj = list(X_test[j])
+        xj_ptxt = make_packed_plaintext(cc, xj, slots)
 
         dot = cc.EvalMult(w_ct, xj_ptxt)
         score = sum_slots(cc, dot, d)
