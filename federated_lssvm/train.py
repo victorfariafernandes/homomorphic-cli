@@ -97,14 +97,16 @@ CLASS_CHECKPOINT_SCHEMA_VERSION = 1
 
 
 def _class_checkpoint_marker(class_dir: str) -> str:
-    return f"{class_dir}/checkpoint.json"
+    # Must NOT be checkpoint.json: the solvers' save_global_checkpoint() writes its
+    # own metadata there, which used to clobber this marker — the next run then
+    # failed the reuse check and regenerated keys, orphaning every checkpoint.
+    return f"{class_dir}/context_marker.txt"
 
 
-def _read_checkpoint_depth(class_dir: str) -> int | None:
-    marker = _class_checkpoint_marker(class_dir)
-    if not os.path.exists(marker):
+def _read_marker_depth(path: str) -> int | None:
+    if not os.path.exists(path):
         return None
-    with open(marker, encoding="utf-8") as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             if line.startswith("depth="):
                 try:
@@ -112,6 +114,39 @@ def _read_checkpoint_depth(class_dir: str) -> int | None:
                 except ValueError:
                     return None
     return None
+
+
+def _read_checkpoint_depth(class_dir: str) -> int | None:
+    depth = _read_marker_depth(_class_checkpoint_marker(class_dir))
+    if depth is not None:
+        return depth
+    # Legacy layout: marker lived in checkpoint.json (only if it still has the
+    # depth= line format, i.e. save_global_checkpoint hasn't overwritten it).
+    return _read_marker_depth(f"{class_dir}/checkpoint.json")
+
+
+def assert_safe_to_create_context(k: int) -> None:
+    """Refuse to generate fresh keys while artifacts from a previous context exist.
+
+    A new secret key silently orphans existing per-client checkpoints: they still
+    deserialize, and wrong-key decrypts can come out *finite*, so the resume path
+    would feed garbage into FedAvg without any error.
+    """
+    import glob
+
+    base = f"models/k={k}"
+    stale = sorted(
+        glob.glob(f"{base}/class_*/client_*/weights.bin")
+        + glob.glob(f"{base}/class_*/baseline/weights.bin")
+        + glob.glob(f"{base}/class_*/cryptocontext.bin")
+    )
+    if stale:
+        raise SystemExit(
+            f"Refusing to create a fresh crypto context: {len(stale)} artifact(s) from a "
+            f"previous context exist under {base}/ (e.g. {stale[0]}). New keys would "
+            f"silently orphan them. If the old context is unusable, move {base} aside "
+            f"(or delete it) and rerun."
+        )
 
 
 def _class_context_exists(class_dir: str, required_depth: int) -> bool:
@@ -126,13 +161,15 @@ def _cts_exist(out_dir: str) -> bool:
 
 
 def _save_cts(out_dir: str, cc, keys, b_ct, w_ct) -> None:
+    # Write via tmp + rename so a killed worker never leaves a truncated
+    # bias.bin/weights.bin that _cts_exist would mistake for a checkpoint.
     os.makedirs(out_dir, exist_ok=True)
-    assert SerializeToFile(
-        f"{out_dir}/bias.bin", b_ct, BINARY
-    ), f"Failed to serialize bias to {out_dir}"
-    assert SerializeToFile(
-        f"{out_dir}/weights.bin", w_ct, BINARY
-    ), f"Failed to serialize weights to {out_dir}"
+    for name, ct in (("bias", b_ct), ("weights", w_ct)):
+        tmp = f"{out_dir}/{name}.bin.tmp"
+        assert SerializeToFile(
+            tmp, ct, BINARY
+        ), f"Failed to serialize {name} to {out_dir}"
+        os.replace(tmp, f"{out_dir}/{name}.bin")
 
 
 def _save_class_context(out_dir: str, cc, keys, depth: int, security: str = "128") -> None:
@@ -170,6 +207,17 @@ def _load_class_context(out_dir: str, matrix_size: int, n_test: int, feature_dim
         )
     rot_indices = rot_indices_fn(matrix_size, n_test, feature_dim=feature_dim)
     cc.EvalRotateKeyGen(sk, rot_indices)
+
+    # Bootstrap precomputations and keys are NOT serialized with the context; a
+    # security="128" context must redo setup + keygen or every EvalBootstrap fails.
+    if read_security_marker(out_dir) == "128":
+        from openfhe import PKESchemeFeature
+
+        cc.Enable(PKESchemeFeature.FHE)
+        cc.EvalBootstrapSetup(
+            solv._BOOTSTRAP_LEVEL_BUDGET, [0, 0], SPARSE_BOOTSTRAP_SLOTS
+        )
+        cc.EvalBootstrapKeyGen(sk, SPARSE_BOOTSTRAP_SLOTS)
 
     class _Keys:
         pass
@@ -333,6 +381,123 @@ def plaintext_federated_reference(
     preds = np.sign(scores)
     preds[preds == 0] = 1.0
     return preds, w_avg, b_avg
+
+
+# ── shared building blocks (used by main() and federated_lssvm.worker) ──────
+
+
+def compute_problem_dims(splits, k: int, n_per_class: int | None):
+    """Deterministic partitions + context sizing shared by train and worker processes."""
+    all_partitions = {}
+    max_client_n = 1
+    for class_idx, (X_tr, _, y_tr, _, _) in enumerate(splits):
+        parts = partition_all(X_tr, y_tr, k)
+        if n_per_class is not None:
+            parts = [
+                _subsample_for_fhe(Xc, yc, n_per_class, seed=42 + class_idx * 1000 + i)
+                for i, (Xc, yc) in enumerate(parts)
+            ]
+        all_partitions[class_idx] = parts
+        max_n = max(len(y_c) for _, y_c in parts) + 1
+        max_client_n = max(max_client_n, max_n)
+    # Single-client baseline uses N_PER_CLASS_BASELINE samples per class
+    max_client_n = max(max_client_n, N_PER_CLASS_BASELINE * 2 + 1)
+
+    sample_X = splits[0][0][:1]
+    max_feat_dim = max_client_n
+    for _, _, feature_map_fn, _ in CLASS_KERNELS.values():
+        d = feature_map_fn(sample_X).shape[1] if feature_map_fn else sample_X.shape[1]
+        max_feat_dim = max(max_feat_dim, d)
+    return all_partitions, max_client_n, max_feat_dim
+
+
+def context_depth(max_client_n: int, security: str) -> int:
+    """Multiplicative depth the shared context is created/tracked with."""
+    depth = (
+        depth_for_size(
+            max_client_n,
+            max_client_n,
+            D_SQRT,
+            D_INV,
+            D_INV_BACKSUB,
+            safety_factor=DEPTH_SAFETY,
+            depth_override=DEPTH_OVERRIDE,
+        )
+        # fhe_aggregate EvalMult(1) + predict_cipher 2×EvalMult(2)
+        # + implicit ModDown(1) + decrypt margin(2)
+        + 6
+    )
+    if security == "128":
+        # The bootstrapping path ignores the no-bootstrap depth estimate above and uses
+        # its own fixed per-round budget; report/track the depth the context really has.
+        depth = solv._BOOTSTRAP_USABLE_DEPTH + solv._BOOTSTRAP_SKIP_BELOW_LEVEL
+    return depth
+
+
+def class_setup(class_idx: int, X_tr, y_tr, verbose: bool = True):
+    """Deterministic per-class config: kernel, feature map, mode string, gamma, phi_mean."""
+    kernel_name, _, feature_map, mode_str = CLASS_KERNELS.get(
+        class_idx, ("linear", linear_kernel, None, "primal:linear")
+    )
+    X_tr_feat, phi_mean = preprocess_features(X_tr, feature_map)
+    if feature_map is not None:
+        gamma, gcv_val = gcv_gamma(X_tr, y_tr, feature_map)
+        if verbose:
+            print(f"  GCV: γ={gamma:.6f}  GCV={gcv_val:.6f}")
+    else:
+        gamma = KERNEL_GAMMA[kernel_name]
+        if verbose:
+            print(f"  Linear kernel: fixed γ={gamma:.4f}")
+    return kernel_name, feature_map, mode_str, gamma, X_tr_feat, phi_mean
+
+
+def baseline_features(X_tr, y_tr, X_te, feature_map):
+    """Deterministic single-client-baseline features (own subsample + own mean)."""
+    X_s, y_s = _subsample_for_fhe(X_tr, y_tr, N_PER_CLASS_BASELINE, seed=42)
+    X_s_feat, phi_mean_s = preprocess_features(X_s, feature_map)
+    X_te_feat_s, _ = preprocess_features(X_te, feature_map, phi_mean=phi_mean_s)
+    return X_s_feat, y_s, X_te_feat_s
+
+
+def solve_client_checkpointed(
+    cc, keys, ckpt_dir: str, X_c_feat, y_c, gamma: float, security: str,
+    label: str = "client",
+):
+    """Resume-or-solve one FHE sub-problem and persist its (bias, weights) checkpoint.
+
+    Idempotent across processes: a finite existing checkpoint is returned as-is, so
+    parallel workers and the finalize pass can all call this for the same task.
+    """
+    if _cts_exist(ckpt_dir):
+        try:
+            b_ct_i, w_ct_i = _load_cts(ckpt_dir)
+        except Exception:
+            b_ct_i = w_ct_i = None
+        if b_ct_i is not None and _cts_are_finite(
+            cc, keys, b_ct_i, w_ct_i, X_c_feat.shape[1]
+        ):
+            print(f"  [{label}] Resuming from checkpoint {ckpt_dir}")
+            return b_ct_i, w_ct_i
+        print(f"  [{label}] Checkpoint invalid or stale, recomputing")
+    H_c, rhs_c = build_lssvm_matrix(X_c_feat, y_c, gamma)
+    print(f"  [{label}] H={H_c.shape}, cond={np.linalg.cond(H_c):.1f} ...")
+    t0 = time.perf_counter()
+    b_ct_i, w_ct_i, _ = solv.solver(
+        cc,
+        keys,
+        H_c.tolist(),
+        rhs_c.tolist(),
+        X_c_feat,
+        y_c,
+        D_sqrt=D_SQRT,
+        D_inv=D_INV,
+        D_inv_backsub=D_INV_BACKSUB,
+        security=security,
+    )
+    print(f"  [{label}] FHE solve: {time.perf_counter() - t0:.1f}s")
+    _save_cts(ckpt_dir, cc, keys, b_ct_i, w_ct_i)
+    print(f"  [{label}] Checkpoint saved.")
+    return b_ct_i, w_ct_i
 
 
 def smoke_test_fedavg(security: str = DEFAULT_SECURITY_LEVEL) -> None:
@@ -527,49 +692,14 @@ def main(
     print(f"Dataset: 120 train / {n_test} test  |  KERNEL_GAMMA={KERNEL_GAMMA}")
     print(f"Chebyshev: sqrt={D_SQRT}, inv_qr={D_INV}, inv_backsub={D_INV_BACKSUB}\n")
 
-    # Step 1: Compute all partitions (plaintext, no FHE) to determine context size
-    all_partitions = {}
-    max_client_n = 1
-    for class_idx, (X_tr, _, y_tr, _, _) in enumerate(splits):
-        parts = partition_all(X_tr, y_tr, k)
-        if n_per_class is not None:
-            parts = [
-                _subsample_for_fhe(Xc, yc, n_per_class, seed=42 + class_idx * 1000 + i)
-                for i, (Xc, yc) in enumerate(parts)
-            ]
-        all_partitions[class_idx] = parts
-        max_n = max(len(y_c) for _, y_c in parts) + 1
-        max_client_n = max(max_client_n, max_n)
-    # Single-client baseline uses N_PER_CLASS_BASELINE samples per class
-    max_client_n = max(max_client_n, N_PER_CLASS_BASELINE * 2 + 1)
+    # Steps 1+2: partitions (plaintext, no FHE) + context sizing (shared with worker.py)
+    all_partitions, max_client_n, max_feat_dim = compute_problem_dims(
+        splits, k, n_per_class
+    )
     print(f"Max client H size: {max_client_n}x{max_client_n}  (k={k})\n")
 
-    # Step 2: Feature dimension for rotation key generation
-    sample_X = splits[0][0][:1]
-    max_feat_dim = max_client_n
-    for _, _, feature_map_fn, _ in CLASS_KERNELS.values():
-        d = feature_map_fn(sample_X).shape[1] if feature_map_fn else sample_X.shape[1]
-        max_feat_dim = max(max_feat_dim, d)
-
     # Step 3: One shared crypto context for all clients and all classes
-    depth = (
-        depth_for_size(
-            max_client_n,
-            max_client_n,
-            D_SQRT,
-            D_INV,
-            D_INV_BACKSUB,
-            safety_factor=DEPTH_SAFETY,
-            depth_override=DEPTH_OVERRIDE,
-        )
-        # fhe_aggregate EvalMult(1) + predict_cipher 2×EvalMult(2)
-        # + implicit ModDown(1) + decrypt margin(2)
-        + 6
-    )
-    if security == "128":
-        # The bootstrapping path ignores the no-bootstrap depth estimate above and uses
-        # its own fixed per-round budget; report/track the depth the context really has.
-        depth = solv._BOOTSTRAP_USABLE_DEPTH + solv._BOOTSTRAP_SKIP_BELOW_LEVEL
+    depth = context_depth(max_client_n, security)
     class_dirs = [f"models/k={k}/class_{class_idx}" for class_idx in range(len(splits))]
     existing_ctx_dir = next(
         (
@@ -591,6 +721,7 @@ def main(
             existing_ctx_dir, max_client_n, n_test, max_feat_dim
         )
     else:
+        assert_safe_to_create_context(k)
         print(f"Setting up shared crypto context (depth={depth}, security={security}) ...")
         t_ctx = time.perf_counter()
         cc, keys = solv.setup_crypto_context(
@@ -633,23 +764,18 @@ def main(
     classifiers_single = []
 
     for class_idx, (X_tr, X_te, y_tr, y_te, name) in enumerate(splits):
-        kernel_name, _, feature_map, mode_str = CLASS_KERNELS.get(
-            class_idx, ("linear", linear_kernel, None, "primal:linear")
+        # Single per-class preprocessing path shared with the plaintext
+        # reference, inference, and parallel workers: linear → raw;
+        # poly → map+center+unit-L2 norm. Gamma: GCV for non-linear, fixed for linear.
+        kernel_name, feature_map, mode_str, gamma, X_tr_feat, phi_mean = class_setup(
+            class_idx, X_tr, y_tr, verbose=False
         )
         print(f"--- Class {class_idx} ({name} vs rest) [kernel={kernel_name}] ---")
-
-        # Single per-class preprocessing path shared with the plaintext
-        # reference and inference: linear → raw; poly → map+center+unit-L2 norm.
-        X_tr_feat, phi_mean = preprocess_features(X_tr, feature_map)
-        X_te_feat, _        = preprocess_features(X_te, feature_map, phi_mean=phi_mean)
-
-        # Per-class gamma: GCV for non-linear kernels, fixed fallback for linear
         if feature_map is not None:
-            gamma, gcv_val = gcv_gamma(X_tr, y_tr, feature_map)
-            print(f"  GCV: γ={gamma:.6f}  GCV={gcv_val:.6f}")
+            print(f"  GCV: γ={gamma:.6f}")
         else:
-            gamma = KERNEL_GAMMA[kernel_name]
             print(f"  Linear kernel: fixed γ={gamma:.4f}")
+        X_te_feat, _ = preprocess_features(X_te, feature_map, phi_mean=phi_mean)
 
         # Full-data plaintext reference
         H_full, rhs_full = build_lssvm_matrix(X_tr_feat, y_tr, gamma)
@@ -676,59 +802,10 @@ def main(
             X_c_feat, _ = preprocess_features(X_c, feature_map, phi_mean=phi_mean)
             parts_feat.append((X_c_feat, y_c))
             ckpt_dir = f"models/k={k}/class_{class_idx}/client_{client_id}"
-            if _cts_exist(ckpt_dir):
-                print(f"  [client {client_id}] Resuming from checkpoint {ckpt_dir}")
-                b_ct_i, w_ct_i = _load_cts(ckpt_dir)
-                _d = X_c_feat.shape[1]
-                if not _cts_are_finite(cc, keys, b_ct_i, w_ct_i, _d):
-                    print(
-                        f"  [client {client_id}] Checkpoint invalid or stale, recomputing"
-                    )
-                    H_c, rhs_c = build_lssvm_matrix(X_c_feat, y_c, gamma)
-                    print(
-                        f"  [client {client_id}] H={H_c.shape}, cond={np.linalg.cond(H_c):.1f} ..."
-                    )
-                    t0 = time.perf_counter()
-                    b_ct_i, w_ct_i, _ = solv.solver(
-                        cc,
-                        keys,
-                        H_c.tolist(),
-                        rhs_c.tolist(),
-                        X_c_feat,
-                        y_c,
-                        D_sqrt=D_SQRT,
-                        D_inv=D_INV,
-                        D_inv_backsub=D_INV_BACKSUB,
-                        security=security,
-                    )
-                    print(
-                        f"  [client {client_id}] FHE solve: {time.perf_counter() - t0:.1f}s"
-                    )
-                    _save_cts(ckpt_dir, cc, keys, b_ct_i, w_ct_i)
-                    print(f"  [client {client_id}] Checkpoint refreshed.")
-            else:
-                H_c, rhs_c = build_lssvm_matrix(X_c_feat, y_c, gamma)
-                print(
-                    f"  [client {client_id}] H={H_c.shape}, cond={np.linalg.cond(H_c):.1f} ..."
-                )
-                t0 = time.perf_counter()
-                b_ct_i, w_ct_i, _ = solv.solver(
-                    cc,
-                    keys,
-                    H_c.tolist(),
-                    rhs_c.tolist(),
-                    X_c_feat,
-                    y_c,
-                    D_sqrt=D_SQRT,
-                    D_inv=D_INV,
-                    D_inv_backsub=D_INV_BACKSUB,
-                    security=security,
-                )
-                print(
-                    f"  [client {client_id}] FHE solve: {time.perf_counter() - t0:.1f}s"
-                )
-                _save_cts(ckpt_dir, cc, keys, b_ct_i, w_ct_i)
-                print(f"  [client {client_id}] Checkpoint saved.")
+            b_ct_i, w_ct_i = solve_client_checkpointed(
+                cc, keys, ckpt_dir, X_c_feat, y_c, gamma, security,
+                label=f"client {client_id}",
+            )
             b_cts.append(b_ct_i)
             w_cts.append(w_ct_i)
 
@@ -775,27 +852,16 @@ def main(
         # Single-client FHE baseline (matches lssvm_cipher.py, N_PER_CLASS=2).
         # Standalone client: preprocess with its OWN mean and evaluate on a test
         # set centered by that same mean, so train/test share one feature frame.
-        X_s, y_s = _subsample_for_fhe(X_tr, y_tr, N_PER_CLASS_BASELINE, seed=42)
-        X_s_feat, phi_mean_s = preprocess_features(X_s, feature_map)
-        X_te_feat_s, _ = preprocess_features(X_te, feature_map, phi_mean=phi_mean_s)
-        H_s, rhs_s = build_lssvm_matrix(X_s_feat, y_s, gamma)
-        print(f"  Single-client baseline H={H_s.shape} ...")
-        t_sc = time.perf_counter()
-        b_ct_s, w_ct_s, _ = solv.solver(
-            cc,
-            keys,
-            H_s.tolist(),
-            rhs_s.tolist(),
-            X_s_feat,
-            y_s,
-            D_sqrt=D_SQRT,
-            D_inv=D_INV,
-            D_inv_backsub=D_INV_BACKSUB,
-            security=security,
+        # Checkpointed like the clients so parallel workers can precompute it.
+        X_s_feat, y_s, X_te_feat_s = baseline_features(X_tr, y_tr, X_te, feature_map)
+        n_s = X_s_feat.shape[0] + 1
+        print(f"  Single-client baseline H=({n_s}, {n_s}) ...")
+        b_ct_s, w_ct_s = solve_client_checkpointed(
+            cc, keys, f"{class_dir}/baseline", X_s_feat, y_s, gamma, security,
+            label="baseline",
         )
-        print(f"  Single-client solve: {time.perf_counter() - t_sc:.1f}s")
         _report_depth(
-            f"single-client solve  (H={H_s.shape[0]}×{H_s.shape[0]})",
+            f"single-client solve  (H={n_s}×{n_s})",
             depth,
             {"b_ct": b_ct_s, "w_ct": w_ct_s},
         )

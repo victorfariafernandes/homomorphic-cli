@@ -43,13 +43,13 @@ variable "ssh_private_key_path" {
 variable "instance_ocpus" {
   type        = number
   default     = 4
-  description = "Number of OCPUs for the A1.Flex instance (free tier max: 4)"
+  description = "Number of OCPUs for the A1.Flex instance (free tier max: 4; parallel k=40 experiment: 64 — see parallel.tfvars.example)"
 }
 
 variable "instance_memory_gb" {
   type        = number
   default     = 24
-  description = "RAM in GB for the A1.Flex instance (free tier max: 24)"
+  description = "RAM in GB for the A1.Flex instance (free tier max: 24; parallel k=40 experiment: 128 — see parallel.tfvars.example)"
 }
 
 variable "boot_volume_size_gb" {

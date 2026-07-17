@@ -30,6 +30,16 @@ def _parse_threads_arg(argv: list[str]) -> tuple[int | None, list[str]]:
 
 
 def init_threads(n: int | None = None) -> int:
+    # Honor the documented resolution order. FHE_THREADS is set by a previous
+    # init_threads() call, so a second bootstrap in the same process (worker.py
+    # then its train.py import) keeps the --threads value instead of resetting
+    # to the default.
+    if n is None:
+        for var in ("FHE_THREADS", "OMP_NUM_THREADS"):
+            val = os.environ.get(var)
+            if val and val.isdigit():
+                n = int(val)
+                break
     if n is None:
         n = DEFAULT_THREADS
     n = max(1, n)

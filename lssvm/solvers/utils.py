@@ -191,7 +191,15 @@ def sum_slots(cc, ct, n: int):
     return result
 
 def simulate_norms(A: list) -> list:
-    """Plaintext Householder QR (sign=+1) returning [(norm_sq_k, vtv_k), ...] for per-step Chebyshev domains."""
+    """Plaintext Householder QR returning [(norm_sq_k, vtv_k, sign_k), ...] per step.
+
+    sign_k = sign(x0) is selected here in plaintext (A is client-known) and baked into
+    the FHE circuit as a constant: v0 = x0 + sign*norm = sign*(|x0| + norm), so
+    v.v = 2*norm*(|x0| + norm) >= 2*norm^2 and never suffers catastrophic cancellation.
+    A fixed sign=+1 collapses v.v toward 0 whenever x0 ~ -||x||, which shrinks the
+    he_inv Chebyshev domain [vtv/margin, vtv*margin] below the approximation/bootstrap
+    noise floor — the encrypted value then escapes the domain and the solve blows up.
+    """
     m, n = len(A), len(A[0])
     r = [list(map(float, row)) for row in A]
     info = []
@@ -201,16 +209,17 @@ def simulate_norms(A: list) -> list:
         norm_sq = sum(xi * xi for xi in x)
         norm_x = math.sqrt(norm_sq)
         if norm_x < 1e-15:
-            info.append((1.0, 1.0))
+            info.append((1.0, 1.0, 1.0))
             continue
-        v0 = x[0] + norm_x
-        vtv = 2.0 * norm_x * v0
+        sign = 1.0 if x[0] >= 0 else -1.0
+        v0 = x[0] + sign * norm_x
+        vtv = 2.0 * sign * norm_x * v0
         if vtv < 1e-15:
-            info.append((norm_sq, 1.0))
+            info.append((norm_sq, 1.0, sign))
             continue
-        info.append((norm_sq, vtv))
+        info.append((norm_sq, vtv, sign))
 
-        v = [x[0] + norm_x] + x[1:]
+        v = [v0] + x[1:]
         norm_v = math.sqrt(sum(vi * vi for vi in v))
         if norm_v < 1e-15:
             continue
@@ -230,8 +239,8 @@ def simulate_diag_values(A: list) -> list:
     return [R[i][i] for i in range(len(R[0]))]
 
 
-def _simulate_qr_sign_plus(A: list) -> list:
-    """Plaintext Householder QR with sign=+1 (matching FHE solver). Returns the R matrix."""
+def _simulate_qr_signed(A: list) -> list:
+    """Plaintext Householder QR with sign=sign(x0) (matching FHE solver). Returns the R matrix."""
     m, n = len(A), len(A[0])
     r = [list(map(float, row)) for row in A]
 
@@ -240,7 +249,8 @@ def _simulate_qr_sign_plus(A: list) -> list:
         norm_x = math.sqrt(sum(xi * xi for xi in x))
         if norm_x < 1e-15:
             continue
-        v = [x[0] + norm_x] + x[1:]  # sign=+1 always
+        sign = 1.0 if x[0] >= 0 else -1.0
+        v = [x[0] + sign * norm_x] + x[1:]
         norm_v = math.sqrt(sum(vi * vi for vi in v))
         if norm_v < 1e-15:
             continue
@@ -255,9 +265,9 @@ def _simulate_qr_sign_plus(A: list) -> list:
 
 def simulate_diag_bounds(A: list, diag_bounds: list = None, safety_margin: float = 0.1,
                          eps_floor: float = 1e-15) -> list:
-    """Compute per-diagonal signed bounds (lo_i, hi_i) for R[i][i] from sign=+1 QR simulation.
+    """Compute per-diagonal signed bounds (lo_i, hi_i) for R[i][i] from signed QR simulation.
 
-    Uses the same sign=+1 Householder convention as the FHE solver so that
+    Uses the same sign=sign(x0) Householder convention as the FHE solver so that
     diagonal signs match the encrypted values exactly.
 
     Bounds preserve the sign of the diagonal. For a negative diagonal d:
@@ -278,7 +288,7 @@ def simulate_diag_bounds(A: list, diag_bounds: list = None, safety_margin: float
     if diag_bounds is not None:
         return diag_bounds
 
-    R = _simulate_qr_sign_plus(A)
+    R = _simulate_qr_signed(A)
     n = len(R[0])
     bounds = []
 

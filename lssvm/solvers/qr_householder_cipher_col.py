@@ -186,8 +186,12 @@ def householder_step_fhe_col(
     D_inv: int = 16,
     slots: int = None,
     bootstrap: bool = False,
+    sign: float = 1.0,
 ):
-    """One Householder reflection at pivot k with column-packed R (sign=+1, zero decryptions).
+    """One Householder reflection at pivot k with column-packed R (zero decryptions).
+
+    sign: reflector sign for this step, chosen in plaintext by simulate_norms as
+    sign(x0) so v0 = x0 + sign*norm never cancels (see qr_householder_cipher_row).
 
     Updates R_cts and Q_cols in-place. If bootstrap=True, every ciphertext in R_cts and
     Q_cols is refreshed via EvalBootstrap after the step (security="128" path).
@@ -210,9 +214,14 @@ def householder_step_fhe_col(
     norm_ct = cc.EvalMult(norm_ct, ptxt_e0)
 
     x0_slot0 = cc.EvalMult(safe_rotate(cc, x_ct, k), ptxt_e0)
-    v0_ct = cc.EvalAdd(x0_slot0, norm_ct)
+    # v0 = x0 + sign*norm; v.v = 2*sign*norm*v0 (positive by construction of sign)
+    v0_ct = (
+        cc.EvalAdd(x0_slot0, norm_ct)
+        if sign >= 0
+        else cc.EvalSub(x0_slot0, norm_ct)
+    )
 
-    vtv_ct = cc.EvalMult(cc.EvalMult(norm_ct, 2.0), v0_ct)
+    vtv_ct = cc.EvalMult(cc.EvalMult(norm_ct, 2.0 * sign), v0_ct)
 
     two_over_vtv_ct = he_inv(cc, vtv_ct, vtv_lo, vtv_hi, D_inv)
     two_over_vtv_ct = cc.EvalMult(two_over_vtv_ct, 2.0)
@@ -276,7 +285,7 @@ def _qr(
 
     steps = min(m, n)
     for k in range(steps):
-        ns, vt = step_norms[k]
+        ns, vt, s = step_norms[k]
         householder_step_fhe_col(
             cc,
             R_cts,
@@ -292,6 +301,7 @@ def _qr(
             D_inv=D_inv,
             slots=slots,
             bootstrap=bootstrap,
+            sign=s,
         )
 
     return Q_cols, R_cts, diag_bounds

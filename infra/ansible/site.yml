@@ -52,8 +52,10 @@
         force: true
 
     - name: Configure OpenFHE build
+      # WITH_NATIVEOPT=ON compiles with -march=native so the NTT inner loops use the
+      # host's SIMD (NEON on Ampere A1, AVX on x86) — safe on a build-and-run-same-host node.
       ansible.builtin.command:
-        cmd: cmake -S {{ build_dir }} -B {{ build_dir }}/build -DBUILD_UNITTESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARKS=OFF -DCMAKE_BUILD_TYPE=Release
+        cmd: cmake -S {{ build_dir }} -B {{ build_dir }}/build -DBUILD_UNITTESTS=OFF -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARKS=OFF -DCMAKE_BUILD_TYPE=Release -DWITH_NATIVEOPT=ON
         creates: "{{ build_dir }}/build/Makefile"
 
     - name: Compile OpenFHE
