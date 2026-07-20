@@ -406,7 +406,7 @@ def load_model(out_dir, d, n_test=None, fmt=BINARY):
 
 
 def decrypt_vector(cc, keys, ct, length: int) -> list:
-    """Decrypt and extract first length values (compatible with lssvm_cipher.py)."""
+    """Decrypt and extract first length values (compatible with lssvm/cipher.py)."""
     from .utils import decrypt_vector as _decrypt_vector
 
     return _decrypt_vector(cc, keys, ct, length)
@@ -555,19 +555,11 @@ def get_slot_count(cc):
 
 
 def predict_cipher(cc, keys, b_ct, w_ct, X_test, slots=None):
-    slots = slots if slots is not None else cc.GetRingDimension() // 2
-    n_test, d = X_test.shape
-    e0_ptxt = cc.MakeCKKSPackedPlaintext([1.0] + [0.0] * (slots - 1))
+    """Score test samples; returns a plaintext list of decision scores (length
+    n_test). Delegates to utils.score_test_batched for consistency with the QR
+    solvers (batched, and slots-metadata-safe for security="128")."""
+    from .utils import score_test_batched
 
-    scores_ct = None
-    for j in range(n_test):
-        xj = list(X_test[j]) + [0.0] * (slots - d)
-        xj_ptxt = cc.MakeCKKSPackedPlaintext(xj)
-        dot = cc.EvalMult(w_ct, xj_ptxt)
-        s = sum_slots(cc, dot, d)
-        s = cc.EvalAdd(s, b_ct)
-        s = cc.EvalMult(s, e0_ptxt)
-        if j != 0:
-            s = safe_rotate(cc, s, -j)
-        scores_ct = s if scores_ct is None else cc.EvalAdd(scores_ct, s)
-    return scores_ct
+    slots = slots if slots is not None else cc.GetRingDimension() // 2
+    _, d = X_test.shape
+    return score_test_batched(cc, keys, b_ct, w_ct, X_test, d, slots)

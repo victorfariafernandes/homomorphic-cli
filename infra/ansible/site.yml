@@ -123,7 +123,15 @@
           - "--exclude=.git"
           - "--exclude=models"
           - "--exclude=venv"
-          - "--chown={{ app_user }}:{{ app_group }}"
+      become: true
+      tags: [sync, code]
+
+    - name: Chown LSSVM source tree
+      ansible.builtin.file:
+        path: "{{ app_dir }}"
+        owner: "{{ app_user }}"
+        group: "{{ app_group }}"
+        recurse: true
       become: true
       tags: [sync, code]
 

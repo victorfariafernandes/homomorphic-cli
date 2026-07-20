@@ -10,6 +10,8 @@ infra/terraform/.terraform
 infra/terraform/terraform.tfstate
 infra/terraform/terraform.tfstate.backup
 infra/terraform/.terraform.lock.hcl
+*.tfvars
+!*.tfvars.example
 
 # Ansible artifacts
 infra/ansible/inventory.ini

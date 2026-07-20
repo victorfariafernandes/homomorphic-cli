@@ -452,7 +452,7 @@ def verify_fhe(A: list, Q: list, R: list, tol: float = 1e-4) -> bool:
     return ok
 
 
-# ─── Compatibility exports (used by lssvm_cipher.py) ───
+# ─── Compatibility exports (used by lssvm/cipher.py) ───
 
 CHECKPOINT_SCHEMA_VERSION = 1
 
@@ -619,42 +619,31 @@ def load_global_checkpoint(
 
 
 def decrypt_vector(cc, keys, ct, length: int) -> list:
-    """Decrypt and extract first length values (compatible with lssvm_cipher.py)."""
+    """Decrypt and extract first length values (compatible with lssvm/cipher.py)."""
     from .utils import decrypt_vector as _decrypt_vector
 
     return _decrypt_vector(cc, keys, ct, length)
 
 
 def get_slot_count(cc) -> int:
-    """Get slot count (compatible with lssvm_cipher.py)."""
+    """Get slot count (compatible with lssvm/cipher.py)."""
     return cc.GetRingDimension() // 2
 
 
 def predict_cipher(cc, keys, b_ct, w_ct, X_test, slots: int = None):
-    """Score test samples using encrypted primal weights (compatible with lssvm_cipher.py).
+    """Score test samples with encrypted primal weights; returns a plaintext list
+    of decision scores (length n_test).
 
-    slots: must be SPARSE_BOOTSTRAP_SLOTS when b_ct/w_ct came from a security="128" solve
-           (bootstrapped ciphertexts) -- see make_packed_plaintext's docstring for why an
-           explicit, matching slots value is required. Defaults to full ring width for
+    Batched via utils.score_test_batched into chunks of `slots`, so n_test greater
+    than the sparse bootstrap width stays correct at security="128" (an un-batched
+    rotation by -j up to -(n_test-1) would wrap modulo num_slots and collide).
+
+    slots: must be SPARSE_BOOTSTRAP_SLOTS when b_ct/w_ct came from a security="128"
+           solve (bootstrapped ciphertexts). Defaults to full ring width for
            legacy/"notset" models.
     """
-    from .utils import sum_slots, safe_rotate
+    from .utils import score_test_batched
 
     slots = slots if slots is not None else cc.GetRingDimension() // 2
-    n_test, d = X_test.shape
-    e0_ptxt = make_packed_plaintext(cc, [1.0], slots)
-
-    scores_ct = None
-    for j in range(n_test):
-        xj = list(X_test[j])
-        xj_ptxt = make_packed_plaintext(cc, xj, slots)
-
-        dot = cc.EvalMult(w_ct, xj_ptxt)
-        score = sum_slots(cc, dot, d)
-        score = cc.EvalAdd(score, b_ct)
-        score = cc.EvalMult(score, e0_ptxt)
-        if j != 0:
-            score = safe_rotate(cc, score, -j)
-        scores_ct = score if scores_ct is None else cc.EvalAdd(scores_ct, score)
-
-    return scores_ct
+    _, d = X_test.shape
+    return score_test_batched(cc, keys, b_ct, w_ct, X_test, d, slots)

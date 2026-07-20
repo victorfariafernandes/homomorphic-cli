@@ -1,8 +1,8 @@
 """Federated LSSVM training via One-Shot FedAvg over CKKS-encrypted weights.
 
 Pipeline:
-  1. Load Iris (120 train / 30 test, stratified split).
-  2. Partition all 120 training samples disjointly across k clients.
+  1. Load the selected dataset (--dataset=iris or breast_cancer), stratified split.
+  2. Partition all training samples disjointly across k clients.
   3. Each client trains a local FHE LS-SVM on their partition.
   4. Server aggregates encrypted weight vectors: w_global = (1/k) * sum(w_ct_i).
   5. Evaluate global model on the 30-sample test set.
@@ -33,6 +33,7 @@ from federated_lssvm.solver_selection import (
     DEFAULT_SECURITY_LEVEL,
     parse_solver_name,
     parse_security_level,
+    parse_dataset_name,
     resolve_solver_module,
 )
 from lssvm.solvers.utils import (
@@ -42,7 +43,6 @@ from lssvm.solvers.utils import (
     read_security_marker,
 )
 from lssvm.preprocessing import (
-    prepare_iris_binary,
     build_lssvm_matrix,
     linear_kernel,
     polynomial_kernel,
@@ -51,7 +51,9 @@ from lssvm.preprocessing import (
     homogeneous_poly_feature_map,
     preprocess_features,
     gcv_gamma,
+    recalibration_threshold,
 )
+from lssvm.preprocessors import DEFAULT_DATASET, kernel_selection, prepare_binary, raw_test_labels
 from lssvm.plain import predict_lssvm
 from config.metrics import weight_relative_error
 
@@ -71,10 +73,10 @@ KERNEL_GAMMA = {
     "homo_poly": 1.27,
 }
 N_PER_CLASS_BASELINE = (
-    2  # used only for the single-client FHE baseline (matches lssvm_cipher.py)
+    2  # used only for the single-client FHE baseline (matches lssvm/cipher.py)
 )
 
-# ── kernel registry (local copy — avoids lssvm_cipher sys.argv side effect) ──
+# ── kernel registry (local copy — avoids lssvm.cipher sys.argv side effect) ──
 CLASS_KERNEL_SELECTION = {0: "linear", 1: "poly", 2: "poly"}
 _KERNEL_REGISTRY = {
     "linear": (linear_kernel, None, "primal:linear"),
@@ -89,6 +91,22 @@ CLASS_KERNELS = {
     idx: (name,) + _KERNEL_REGISTRY[name]
     for idx, name in CLASS_KERNEL_SELECTION.items()
 }
+
+
+def configure_dataset(dataset: str) -> None:
+    """Reconfigure per-class kernel selection for the given dataset (globals).
+
+    Must be called before class_setup/compute_problem_dims when running a
+    dataset other than the default -- CLASS_KERNEL_SELECTION/CLASS_KERNELS are
+    read as module globals throughout this file (and by federated_lssvm.worker,
+    which calls T.configure_dataset(dataset) before touching any shared state).
+    """
+    global CLASS_KERNEL_SELECTION, CLASS_KERNELS
+    CLASS_KERNEL_SELECTION = kernel_selection(dataset)
+    CLASS_KERNELS = {
+        idx: (name,) + _KERNEL_REGISTRY[name]
+        for idx, name in CLASS_KERNEL_SELECTION.items()
+    }
 
 
 # ── per-client checkpoint helpers ──────────────────────────────────
@@ -245,7 +263,7 @@ def _cts_are_finite(cc, keys, b_ct, w_ct, d: int) -> bool:
     return np.isfinite(b_val) and np.all(np.isfinite(w_vals))
 
 
-# ── subsample helper (inline copy from lssvm_cipher.py) ────────────
+# ── subsample helper (inline copy from lssvm/cipher.py) ────────────
 def _subsample_for_fhe(
     X_train: np.ndarray,
     y_train: np.ndarray,
@@ -409,6 +427,40 @@ def compute_problem_dims(splits, k: int, n_per_class: int | None):
         d = feature_map_fn(sample_X).shape[1] if feature_map_fn else sample_X.shape[1]
         max_feat_dim = max(max_feat_dim, d)
     return all_partitions, max_client_n, max_feat_dim
+
+
+def assert_fits_bootstrap_slots(security, splits, max_client_n, max_feat_dim):
+    """Fail fast if the problem doesn't fit the fixed sparse bootstrap width.
+
+    At security="128" every rotation runs against sparse-bootstrapped ciphertexts
+    with SPARSE_BOOTSTRAP_SLOTS slots; a rotation index >= that width wraps modulo
+    num_slots and silently corrupts results (see lssvm/solvers/utils.py). So the
+    per-client matrix size and the feature dimension must both fit. (n_test is
+    handled separately by batched predict_cipher.) No-op for security != "128".
+    """
+    if security != "128":
+        return
+    slots = SPARSE_BOOTSTRAP_SLOTS
+    # Matrix size is k-dependent, so check it first (and it dominates max_feat_dim,
+    # which compute_problem_dims sizes as max(max_client_n, real feature dims)).
+    if max_client_n > slots:
+        max_train = max(len(s[0]) for s in splits)
+        min_k = -(-max_train // (slots - 1))  # ceil(max_train / (slots - 1))
+        raise ValueError(
+            f"Max client matrix {max_client_n}x{max_client_n} exceeds "
+            f"SPARSE_BOOTSTRAP_SLOTS={slots} at security=128 (rotations would wrap "
+            f"and corrupt results). Increase clients to k>={min_k} "
+            f"(e.g. 'federated_lssvm.train {min_k} --dataset=...'), or pass "
+            f"--n-per-class to subsample each client."
+        )
+    # Matrix fits, so any remaining overflow is a genuine feature-dimension problem
+    # (kernel feature map too wide) — not fixable by changing k.
+    if max_feat_dim > slots:
+        raise ValueError(
+            f"feature_dim={max_feat_dim} exceeds SPARSE_BOOTSTRAP_SLOTS={slots} at "
+            f"security=128; this dataset/kernel needs a larger bootstrap slot width "
+            f"and cannot be made to fit by changing k."
+        )
 
 
 def context_depth(max_client_n: int, security: str) -> int:
@@ -680,22 +732,27 @@ def main(
     n_per_class: int | None = None,
     solver_name: str | None = None,
     security: str = DEFAULT_SECURITY_LEVEL,
+    dataset: str = DEFAULT_DATASET,
 ) -> None:
     global solv
     solv = resolve_solver_module(solver_name or DEFAULT_SOLVER_NAME)
     slots = SPARSE_BOOTSTRAP_SLOTS if security == "128" else None
 
-    splits = prepare_iris_binary()
-    n_test = len(splits[0][1])  # 30
+    configure_dataset(dataset)
+    splits = prepare_binary(dataset)
+    n_train = len(splits[0][0])
+    n_test = len(splits[0][1])
+    label = "OvR" if len(splits) > 1 else "binary"
 
-    print(f"=== Federated FHE LS-SVM (Iris OvR, k={k} clients) ===")
-    print(f"Dataset: 120 train / {n_test} test  |  KERNEL_GAMMA={KERNEL_GAMMA}")
+    print(f"=== Federated FHE LS-SVM ({dataset} {label}, k={k} clients) ===")
+    print(f"Dataset: {n_train} train / {n_test} test  |  KERNEL_GAMMA={KERNEL_GAMMA}")
     print(f"Chebyshev: sqrt={D_SQRT}, inv_qr={D_INV}, inv_backsub={D_INV_BACKSUB}\n")
 
     # Steps 1+2: partitions (plaintext, no FHE) + context sizing (shared with worker.py)
     all_partitions, max_client_n, max_feat_dim = compute_problem_dims(
         splits, k, n_per_class
     )
+    assert_fits_bootstrap_slots(security, splits, max_client_n, max_feat_dim)
     print(f"Max client H size: {max_client_n}x{max_client_n}  (k={k})\n")
 
     # Step 3: One shared crypto context for all clients and all classes
@@ -828,28 +885,30 @@ def main(
             {"b_global": b_global, "w_global": w_global},
         )
 
-        # Encrypted inference with global model
-        t_inf = time.perf_counter()
-        scores_ct = solv.predict_cipher(cc, keys, b_global, w_global, X_te_feat, slots=slots)
-        print(f"  Cipher predict: {time.perf_counter() - t_inf:.4f}s")
-        scores_fed = np.array(solv.decrypt_vector(cc, keys, scores_ct, n_test))
-        _report_depth(
-            f"inference  (n_test={n_test})",
-            depth,
-            {"scores_ct": scores_ct},
-        )
-        preds_fed = np.sign(scores_fed)
-        preds_fed[preds_fed == 0] = 1.0
-
         # Decrypt federated weights for error reporting
         w_fhe_fed = np.array(solv.decrypt_vector(cc, keys, w_global, d))
+        b_fhe_fed = solv.decrypt_vector(cc, keys, b_global, 1)[0]
+
+        # Class-mean-midpoint bias recalibration (mirrors plain_run.py): this
+        # solver's KKT variant is only zero-centred for balanced classes, so
+        # compute the threshold from the federated model's own training scores
+        # and persist it for infer.py to subtract at inference time (0 FHE cost).
+        train_scores_fed = X_tr_feat @ w_fhe_fed + b_fhe_fed
+        threshold = recalibration_threshold(train_scores_fed, y_tr)
+
+        # Encrypted inference with global model
+        t_inf = time.perf_counter()
+        scores_fed = np.array(solv.predict_cipher(cc, keys, b_global, w_global, X_te_feat, slots=slots)) - threshold
+        print(f"  Cipher predict: {time.perf_counter() - t_inf:.4f}s")
+        preds_fed = np.sign(scores_fed)
+        preds_fed[preds_fed == 0] = 1.0
 
         # Plaintext federated reference
         preds_plain_fed, w_plain_fed, _ = plaintext_federated_reference(
             parts_feat, X_te_feat, gamma
         )
 
-        # Single-client FHE baseline (matches lssvm_cipher.py, N_PER_CLASS=2).
+        # Single-client FHE baseline (matches lssvm/cipher.py, N_PER_CLASS=2).
         # Standalone client: preprocess with its OWN mean and evaluate on a test
         # set centered by that same mean, so train/test share one feature frame.
         # Checkpointed like the clients so parallel workers can precompute it.
@@ -865,8 +924,7 @@ def main(
             depth,
             {"b_ct": b_ct_s, "w_ct": w_ct_s},
         )
-        scores_ct_s = solv.predict_cipher(cc, keys, b_ct_s, w_ct_s, X_te_feat_s, slots=slots)
-        scores_s = np.array(solv.decrypt_vector(cc, keys, scores_ct_s, n_test))
+        scores_s = np.array(solv.predict_cipher(cc, keys, b_ct_s, w_ct_s, X_te_feat_s, slots=slots))
         preds_single = np.sign(scores_s)
         preds_single[preds_single == 0] = 1.0
 
@@ -897,6 +955,7 @@ def main(
                 security=security,
             )
             np.save(f"{out_dir}/phi_mean.npy", phi_mean)
+            np.save(f"{out_dir}/threshold.npy", threshold)
             print(f"  Global model serialized to {out_dir}/  [{mode_str}]")
 
         # # Delete per-client checkpoints now that aggregation succeeded
@@ -909,30 +968,24 @@ def main(
         classifiers_fed.append({"class_idx": class_idx, "scores": scores_fed})
         classifiers_single.append({"class_idx": class_idx, "scores": scores_s})
 
-    # OvR multiclass accuracy
-    from sklearn.datasets import load_iris
-    from sklearn.model_selection import train_test_split as tts
-
-    iris = load_iris()
-    _, _, _, y_test_raw = tts(
-        iris.data,
-        iris.target,
-        test_size=0.2,
-        stratify=iris.target,
-        random_state=42,
-    )
+    # Binary (single class) or OvR multiclass accuracy, dataset-aware
+    y_test_raw = raw_test_labels(dataset)
 
     def _ovr_acc(classifiers):
+        if len(classifiers) == 1:
+            preds = np.sign(classifiers[0]["scores"])
+            preds[preds == 0] = 1.0
+            return float(np.mean(preds == y_test_raw) * 100)
         score_matrix = np.column_stack([c["scores"] for c in classifiers])
         class_indices = np.array([c["class_idx"] for c in classifiers])
         predicted = class_indices[score_matrix.argmax(axis=1)]
-        return np.mean(predicted == y_test_raw) * 100
+        return float(np.mean(predicted == y_test_raw) * 100)
 
     print(
-        f"OvR Multiclass Accuracy (Federated FHE, k={k}): {_ovr_acc(classifiers_fed):.2f}%"
+        f"{label} Accuracy (Federated FHE, k={k}): {_ovr_acc(classifiers_fed):.2f}%"
     )
     print(
-        f"OvR Multiclass Accuracy (Single-client FHE):      {_ovr_acc(classifiers_single):.2f}%"
+        f"{label} Accuracy (Single-client FHE):      {_ovr_acc(classifiers_single):.2f}%"
     )
 
 
@@ -955,10 +1008,12 @@ if __name__ == "__main__":
 
     solver_name = parse_solver_name(args)
     security = parse_security_level(args)
+    dataset = parse_dataset_name(args)
     main(
         k=k,
         serialize=serialize,
         n_per_class=n_per_class,
         solver_name=solver_name,
         security=security,
+        dataset=dataset,
     )

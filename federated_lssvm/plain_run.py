@@ -1,9 +1,9 @@
 """Plaintext FedAvg runner for federated LSSVM (no FHE).
 
 Usage:
-    python -m federated_lssvm.plain_run [k]
+    python -m federated_lssvm.plain_run [k] [--dataset=iris|breast_cancer]
 
-Defaults to k=3 clients.
+Defaults to k=3 clients, dataset=iris.
 """
 from __future__ import annotations
 
@@ -11,7 +11,6 @@ import sys
 import time
 import numpy as np
 from lssvm.preprocessing import (
-    prepare_iris_binary,
     build_lssvm_matrix,
     linear_kernel,
     polynomial_kernel,
@@ -20,12 +19,22 @@ from lssvm.preprocessing import (
     homogeneous_poly_feature_map,
     preprocess_features,
     gcv_gamma,
+    recalibration_threshold,
+)
+from lssvm.preprocessors import (
+    DEFAULT_DATASET,
+    kernel_selection,
+    prepare_binary,
+    raw_test_labels,
 )
 from lssvm.plain import predict_lssvm
+from lssvm.solvers.utils import SPARSE_BOOTSTRAP_SLOTS
+from federated_lssvm.solver_selection import parse_dataset_name
 
-# setosa is linearly separable — linear kernel gives 100% binary accuracy at γ=1.1.
-# versicolor/virginica overlap; poly kernel + GCV-tuned γ gives 90% each → 96.67% OvR.
-CLASS_KERNEL_SELECTION = {0: "linear", 1: "poly", 2: "poly"}
+# Kernel selection is per-dataset (see lssvm.preprocessors.DATASET_KERNEL_SELECTION):
+#   iris — setosa is linearly separable (linear, 100% at γ=1.1); versicolor/virginica
+#          overlap (poly + GCV-tuned γ → ~96.67% OvR).
+#   breast_cancer — single binary problem, linear kernel.
 
 # Fallback gamma values (GCV overrides at run-time for poly classes).
 # For linear/setosa: γ=1.1 is manually chosen — GCV minimizes regression loss, not
@@ -45,10 +54,14 @@ _KERNEL_REGISTRY = {
         "primal:homo_poly:degree=2",
     ),
 }
-CLASS_KERNELS = {
-    idx: (name,) + _KERNEL_REGISTRY[name]
-    for idx, name in CLASS_KERNEL_SELECTION.items()
-}
+
+
+def build_class_kernels(dataset: str) -> dict:
+    """Class-index -> (name, kernel, feature_map, mode_str) map for the dataset."""
+    return {
+        idx: (name,) + _KERNEL_REGISTRY[name]
+        for idx, name in kernel_selection(dataset).items()
+    }
 
 
 def partition_all(X: np.ndarray, y: np.ndarray, k: int, base_seed: int = 42):
@@ -98,10 +111,16 @@ def plaintext_federated_reference(partitions_feat, X_te_feat, gamma: float):
     return preds, w_avg, b_avg, client_times, inference_time
 
 
-def main(k: int = 3):
-    splits = prepare_iris_binary()
+def main(k: int = 3, dataset: str = DEFAULT_DATASET):
+    splits = prepare_binary(dataset)
+    class_kernels = build_class_kernels(dataset)
     n_test = len(splits[0][1])
-    print(f"Plaintext Federated LSSVM (Iris OvR, k={k})")
+    n_train = len(splits[0][0])
+    label = "OvR" if len(splits) > 1 else "binary"
+    print(
+        f"Plaintext Federated LSSVM ({dataset} {label}, k={k})  "
+        f"| {n_train} train / {n_test} test"
+    )
     classifiers_plain_fed = []
     classifiers_full = []
 
@@ -112,7 +131,7 @@ def main(k: int = 3):
     all_client_times: list[list[float]] = []
 
     for class_idx, (X_tr, X_te, y_tr, y_te, name) in enumerate(splits):
-        kernel_name, _, feature_map, mode_str = CLASS_KERNELS.get(
+        kernel_name, _, feature_map, mode_str = class_kernels.get(
             class_idx, ("linear", linear_kernel, None, "primal:linear")
         )
 
@@ -142,18 +161,38 @@ def main(k: int = 3):
         except np.linalg.LinAlgError:
             sol_full = np.linalg.lstsq(H_full, rhs_full, rcond=None)[0]
         alpha_full = sol_full[1:]
-        preds_plain_full, scores_full = predict_lssvm(
+        _, scores_full = predict_lssvm(
             X_te_feat, X_tr_feat, alpha_full, y_tr, sol_full[0]
         )
+        # Recalibrate the full-data reference too, for a fair comparison.
+        _, train_scores_full = predict_lssvm(
+            X_tr_feat, X_tr_feat, alpha_full, y_tr, sol_full[0]
+        )
+        thr_full = recalibration_threshold(train_scores_full, y_tr)
+        scores_full = scores_full - thr_full
+        preds_plain_full = np.sign(scores_full)
+        preds_plain_full[preds_plain_full == 0] = 1.0
 
         # Partition and per-client plaintext solves
         parts = partition_all(X_tr_feat, y_tr, k)
         parts_feat = [(Xc, yc) for (Xc, yc) in parts]
+
+        # Surface the 32-slot bootstrap constraint that gates the 128-bit FHE path:
+        # each client's LSSVM matrix is (n_client+1)x(n_client+1) and must be
+        # <= SPARSE_BOOTSTRAP_SLOTS for security="128" (see lssvm/solvers/utils.py).
+        max_client_n = max(len(yc) for _, yc in parts_feat) + 1
+        max_feat_dim = X_tr_feat.shape[1]
+        fits = max_client_n <= SPARSE_BOOTSTRAP_SLOTS and max_feat_dim <= SPARSE_BOOTSTRAP_SLOTS
+        print(
+            f"  Max client matrix: {max_client_n}x{max_client_n}, feat_dim={max_feat_dim} "
+            f"| 128-bit fits <= {SPARSE_BOOTSTRAP_SLOTS} slots? {'YES' if fits else 'NO'}"
+        )
+
         for client_id, (Xc, yc) in enumerate(parts_feat):
             H_c, rhs_c = build_lssvm_matrix(Xc, yc, gamma)
             print(f"  [client {client_id}] H={H_c.shape}, cond={np.linalg.cond(H_c):.2f} ...")
 
-        preds_plain_fed, w_plain_fed, _, client_times, infer_time = (
+        preds_plain_fed, w_plain_fed, b_plain_fed, client_times, infer_time = (
             plaintext_federated_reference(parts_feat, X_te_feat, gamma)
         )
 
@@ -162,7 +201,18 @@ def main(k: int = 3):
         class_infer_times.append(infer_time)
         all_client_times.append(client_times)
 
-        classifiers_plain_fed.append({"class_idx": class_idx, "scores": X_te_feat @ w_plain_fed})
+        # Class-mean-midpoint bias recalibration: the KKT variant separates well
+        # but its threshold-0 is only centred for balanced classes. Compute the
+        # threshold from this model's own training scores and subtract it, so both
+        # the OvR argmax and the single-binary sign act on calibrated scores.
+        train_scores = X_tr_feat @ w_plain_fed + b_plain_fed
+        threshold = recalibration_threshold(train_scores, y_tr)
+        recal_scores = X_te_feat @ w_plain_fed + b_plain_fed - threshold
+        recal_preds = np.sign(recal_scores)
+        recal_preds[recal_preds == 0] = 1.0
+        classifiers_plain_fed.append(
+            {"class_idx": class_idx, "scores": recal_scores, "preds": recal_preds, "y_te": y_te}
+        )
         classifiers_full.append({"class_idx": class_idx, "scores": scores_full})
 
         def acc(p: np.ndarray) -> float:
@@ -191,7 +241,7 @@ def main(k: int = 3):
         print(f"  {'Approach':<36} | Accuracy | Precision |   F1  ")
         print(f"  {'-'*36}-+---------+-----------+-------")
         print(
-            f"  {'Plain FedAvg':<36} | {acc(preds_plain_fed):7.2f}% | {precision(preds_plain_fed):9.2f}% | {f1(preds_plain_fed):6.2f}%"
+            f"  {'Plain FedAvg':<36} | {acc(recal_preds):7.2f}% | {precision(recal_preds):9.2f}% | {f1(recal_preds):6.2f}%"
         )
         print(
             f"  {'Full-data (reference)':<36} | {acc(preds_plain_full):7.2f}% | {precision(preds_plain_full):9.2f}% | {f1(preds_plain_full):6.2f}%"
@@ -205,26 +255,22 @@ def main(k: int = 3):
 
     t_train_total = time.perf_counter() - t_train_total_start
 
-    # OvR multiclass accuracy using score matrices
-    from sklearn.datasets import load_iris
-    from sklearn.model_selection import train_test_split as tts
+    # Multiclass (OvR argmax) or binary (sign) accuracy, on recalibrated scores.
+    y_test_raw = raw_test_labels(dataset)
 
-    iris = load_iris()
-    _, _, _, y_test_raw = tts(
-        iris.data,
-        iris.target,
-        test_size=0.2,
-        stratify=iris.target,
-        random_state=42,
-    )
-
-    def _ovr_acc(classifiers):
+    def _multiclass_acc(classifiers):
+        if len(classifiers) == 1:
+            # Single binary problem: recalibrated preds ({+1,-1}) compared directly
+            # to the split's own y_te ({+1,-1}) — orientation-independent.
+            c = classifiers[0]
+            return np.mean(c["preds"] == c["y_te"]) * 100
         score_matrix = np.column_stack([c["scores"] for c in classifiers])
         class_indices = np.array([c["class_idx"] for c in classifiers])
         predicted = class_indices[score_matrix.argmax(axis=1)]
         return np.mean(predicted == y_test_raw) * 100
 
-    print(f"OvR Multiclass Accuracy (Federated plaintext, k={k}): {_ovr_acc(classifiers_plain_fed):.2f}%")
+    acc_label = "OvR Multiclass" if len(splits) > 1 else "Binary"
+    print(f"{acc_label} Accuracy (Federated plaintext, k={k}): {_multiclass_acc(classifiers_plain_fed):.2f}%")
 
     # ── Timing summary ──────────────────────────────────────────────
     print(f"\n=== Timing Summary (k={k}) ===")
@@ -242,4 +288,5 @@ if __name__ == "__main__":
     args = sys.argv[1:]
     numeric_args = [a for a in args if a.lstrip("-").isdigit()]
     k = int(numeric_args[0]) if numeric_args else 3
-    main(k=k)
+    dataset = parse_dataset_name(args)
+    main(k=k, dataset=dataset)

@@ -36,30 +36,55 @@ fi
 LOGDIR="models/k=${K}/logs"
 mkdir -p "$LOGDIR"
 
+# Dataset name for the run report (default matches federated_lssvm defaults).
+DATASET="iris"
+for a in "${EXTRA[@]}"; do
+    case "$a" in --dataset=*) DATASET="${a#--dataset=}" ;; esac
+done
+
+T0=$SECONDS
 # Prepare and finalize run alone on the box — give them every core, not a worker's share.
-echo "[1/3] Preparing shared crypto context (k=$K) ..."
+echo "[1/4] Preparing shared crypto context (k=$K) ..."
 python3 -u -m federated_lssvm.worker --k="$K" --prepare-context --threads="$NCPU" \
     "${EXTRA[@]}" 2>&1 | tee "$LOGDIR/prepare.log"
+T_PREPARE=$((SECONDS - T0))
 
-echo "[2/3] Launching $W workers x $THREADS threads ..."
+echo "[2/4] Launching $W workers x $THREADS threads ..."
 PIDS=()
 for i in $(seq 0 $((W - 1))); do
+    # Pin each worker to its own disjoint core block. Without this, every worker
+    # independently computes the SAME OMP spread placement (config/parallel.py sets
+    # OMP_PROC_BIND=spread), stacking all threads on ~4 cores. setdefault in
+    # init_threads keeps the values exported here.
+    if [ "$TOTAL" -le "$NCPU" ]; then
+        export OMP_PROC_BIND=close OMP_PLACES="{$((i * THREADS)):$THREADS}"
+    else
+        export OMP_PROC_BIND=false
+    fi
     python3 -u -m federated_lssvm.worker --k="$K" --shard="$i/$W" --threads="$THREADS" \
         "${EXTRA[@]}" > "$LOGDIR/worker_$i.log" 2>&1 &
     PIDS+=($!)
 done
+unset OMP_PROC_BIND OMP_PLACES
 echo "  worker PIDs: ${PIDS[*]}  (logs: $LOGDIR/worker_N.log)"
 
 FAIL=0
 for p in "${PIDS[@]}"; do
     wait "$p" || FAIL=1
 done
+T_WORKERS=$((SECONDS - T0 - T_PREPARE))
 if [ "$FAIL" -ne 0 ]; then
     echo "ERROR: one or more workers failed — see $LOGDIR/worker_*.log" >&2
     grep -l -i -E "traceback|error" "$LOGDIR"/worker_*.log >&2 || true
     exit 1
 fi
 
-echo "[3/3] Finalize: aggregate + evaluate ..."
+echo "[3/4] Finalize: aggregate + evaluate ..."
 python3 -u -m federated_lssvm.train "$K" --threads="$NCPU" \
     "${EXTRA[@]}" 2>&1 | tee "$LOGDIR/finalize.log"
+T_FINALIZE=$((SECONDS - T0 - T_PREPARE - T_WORKERS))
+
+echo "[4/4] Appending run report ..."
+python3 -m config.report --k="$K" --dataset="$DATASET" --logs="$LOGDIR" \
+    --out="models/k=${K}/report.md" \
+    --prepare-s="$T_PREPARE" --workers-s="$T_WORKERS" --finalize-s="$T_FINALIZE"

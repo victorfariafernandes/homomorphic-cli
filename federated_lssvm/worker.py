@@ -30,12 +30,14 @@ import time
 
 from federated_lssvm.solver_selection import (
     DEFAULT_SOLVER_NAME,
+    parse_dataset_name,
     parse_solver_name,
     parse_security_level,
     resolve_solver_module,
 )
 import federated_lssvm.train as T
-from lssvm.preprocessing import prepare_iris_binary, preprocess_features
+from lssvm.preprocessing import preprocess_features
+from lssvm.preprocessors import prepare_binary
 
 
 def _parse_args(args: list[str]):
@@ -74,13 +76,18 @@ def main() -> None:
     k, shard, prepare_context, n_per_class = _parse_args(args)
     solver_name = parse_solver_name(args)
     security = parse_security_level(args)
+    dataset = parse_dataset_name(args)
     T.solv = resolve_solver_module(solver_name or DEFAULT_SOLVER_NAME)
 
-    splits = prepare_iris_binary()
+    # Must match train.py: configure the same kernel map and load the same splits,
+    # or the worker's context sizing / checkpoints won't line up with aggregation.
+    T.configure_dataset(dataset)
+    splits = prepare_binary(dataset)
     n_test = len(splits[0][1])
     all_partitions, max_client_n, max_feat_dim = T.compute_problem_dims(
         splits, k, n_per_class
     )
+    T.assert_fits_bootstrap_slots(security, splits, max_client_n, max_feat_dim)
     depth = T.context_depth(max_client_n, security)
     context_dir = f"models/k={k}/class_0"
 

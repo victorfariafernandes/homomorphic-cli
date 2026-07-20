@@ -1,3 +1,9 @@
+terraform {
+  required_providers {
+    oci = { source = "oracle/oci", version = "~> 6.0" }
+  }
+}
+
 variable "compartment_id" {
   type        = string
   description = "OCI compartment OCID for all resources"

@@ -228,11 +228,11 @@ def main():
         # ── cipher prediction (primal, no training data needed) ──
         t_cp = time.perf_counter()
         predict_kwargs = {"slots": slots} if _SUPPORTS_BOOTSTRAP_SECURITY else {}
-        scores_cipher_ct = solv.predict_cipher(cc, keys, b_ct, w_ct, X_te_feat, **predict_kwargs)
-        print(f"  Cipher predict (primal): {time.perf_counter() - t_cp:.4f}s")
+        # predict_cipher batches internally and returns plaintext scores.
         scores_cipher = np.array(
-            solv.decrypt_vector(cc, keys, scores_cipher_ct, len(X_te_feat))
+            solv.predict_cipher(cc, keys, b_ct, w_ct, X_te_feat, **predict_kwargs)
         )
+        print(f"  Cipher predict (primal): {time.perf_counter() - t_cp:.4f}s")
         preds_cipher = np.sign(scores_cipher)
         preds_cipher[preds_cipher == 0] = 1.0
 

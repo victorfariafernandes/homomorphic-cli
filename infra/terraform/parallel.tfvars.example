@@ -1,13 +1,26 @@
-# Sizing for the parallel k=40 FHE experiment (config/run_parallel.sh 40 16 4).
+# Sizing for the parallel k=40 FHE experiment.
 #
-# VM.Standard.A1.Flex: $0.01/OCPU-hr + $0.0015/GB-hr => ~$0.83/hr at this size;
-# the full experiment (provision + OpenFHE build + ~1.5h run) costs ~$3.
-# 16 workers x 4 OMP threads = 64 OCPUs; each worker holds its own N=131072
-# CKKS context (~6 GB peak) => 128 GB RAM.
+# VM.Standard.A1.Flex: $0.01/OCPU-hr + $0.0015/GB-hr => ~$0.83/hr at this size.
 #
-# Usage: copy to parallel.tfvars (or merge into your terraform.tfvars), then
+# MEASURED 2026-07-16: a security=128 worker (N=131072 context + rotation +
+# bootstrap eval keys) peaks at ~24 GB RSS, not the ~6 GB first estimated.
+# At 128 GB RAM the box fits only 4-5 workers => run `run_parallel.sh 40 4 16`
+# (4 workers x 16 threads; ~9 min/solve, NTT scaling flattens past ~8 threads).
+# For the full 16 workers x 4 threads geometry, provision instance_memory_gb=384.
+#
+# Usage: copy to parallel.tfvars (gitignored — never commit real credentials),
+# fill in the OCI identifiers below, then
 #   terraform apply -var-file=parallel.tfvars
 # Scale back down (or destroy) after the run.
 
-instance_ocpus     = 64
-instance_memory_gb = 128
+tenancy_ocid          = "ocid1.tenancy.oc1..REPLACE_ME"
+user_ocid             = "ocid1.user.oc1..REPLACE_ME"
+fingerprint           = "REPLACE_ME"
+ssh_private_key_path  = "~/.ssh/REPLACE_ME"
+region                = "us-ashburn-1"
+compartment_id        = "ocid1.compartment.oc1..REPLACE_ME"
+ssh_public_key        = "ssh-rsa REPLACE_ME"
+ssh_deploy_public_key = "ssh-rsa REPLACE_ME"
+
+instance_ocpus     = 72
+instance_memory_gb = 470

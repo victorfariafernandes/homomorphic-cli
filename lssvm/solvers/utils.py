@@ -415,6 +415,39 @@ def he_back_substitute(cc, keys, R_cts: list, c_ct, n: int,
     return x_ct
 
 
+def score_test_batched(cc, keys, b_ct, w_ct, X_test, d: int, slots: int) -> list:
+    """Score test points with encrypted primal weights, batched into chunks of `slots`.
+
+    Each score s_j = w·x_j + b is computed identically to the single-shot path, but
+    placed at its LOCAL index within a chunk of at most `slots` points via
+    safe_rotate(-local_j) (local_j < slots), so no rotation ever wraps modulo the
+    (sparse-bootstrapped) num_slots. Each chunk is decrypted and concatenated,
+    yielding a plaintext list of length len(X_test).
+
+    This is what makes n_test > SPARSE_BOOTSTRAP_SLOTS correct at security="128":
+    the un-batched loop rotates by -j up to -(n_test-1), which wraps mod 32 and
+    collides scores into wrong slots. For large `slots` ("notset", slots >= n_test)
+    this reduces to a single chunk == the original per-point scoring.
+    """
+    e0_ptxt = make_packed_plaintext(cc, [1.0], slots)
+    scores: list = []
+    n_test = len(X_test)
+    for start in range(0, n_test, slots):
+        chunk = X_test[start:start + slots]
+        chunk_ct = None
+        for local_j, x in enumerate(chunk):
+            xj_ptxt = make_packed_plaintext(cc, list(x), slots)
+            dot = cc.EvalMult(w_ct, xj_ptxt)
+            s = sum_slots(cc, dot, d)
+            s = cc.EvalAdd(s, b_ct)
+            s = cc.EvalMult(s, e0_ptxt)
+            if local_j != 0:
+                s = safe_rotate(cc, s, -local_j)
+            chunk_ct = s if chunk_ct is None else cc.EvalAdd(chunk_ct, s)
+        scores.extend(decrypt_vector(cc, keys, chunk_ct, len(chunk)))
+    return scores
+
+
 def he_primal_weights(cc, x_ct, X_train, y_train, slots: int | None = None):
     """Compute primal weight vector w = Σᵢ αᵢ·yᵢ·x_train_i inside FHE.
 

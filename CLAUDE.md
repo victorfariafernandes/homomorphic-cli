@@ -19,6 +19,17 @@ Least-Squares SVM training + inference over CKKS-encrypted data using OpenFHE. I
 - `python -m lssvm.inference` — encrypted inference
 - `python -m lssvm.plain` — plaintext reference
 
+## Dataset selection
+- `--dataset=iris` (default) or `--dataset=breast_cancer` on train/infer/plain_run
+  (parsed by `federated_lssvm.solver_selection.parse_dataset_name`; datasets live
+  in the `lssvm/preprocessors/` package, one folder each).
+- 128-bit FHE packs a fixed 32-slot bootstrap width, so per-client matrices must
+  be ≤ 32. Breast cancer (455 train pts) therefore needs many clients:
+  **use `k>=15` (recommend `k=20`)**, e.g.
+  `bash config/run.sh federated_lssvm.train 20 --dataset=breast_cancer`.
+  A guard (`assert_fits_bootstrap_slots`) fails fast with the minimum k if too small.
+  `predict_cipher` batches the test set into ≤32 chunks so n_test can exceed 32.
+
 ## Key modules
 - `lssvm/plain.py` — reference plaintext LSSVM
 - `lssvm/cipher.py` — encrypted LSSVM over CKKS

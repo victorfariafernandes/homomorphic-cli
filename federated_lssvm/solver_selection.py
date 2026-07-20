@@ -5,6 +5,8 @@ from __future__ import annotations
 import importlib
 import os
 
+from lssvm.preprocessors import DEFAULT_DATASET, SUPPORTED_DATASETS
+
 SUPPORTED_SOLVER_MODULES = {
     "cg": "lssvm.solvers.cg_cipher",
     "cg_cipher": "lssvm.solvers.cg_cipher",
@@ -22,6 +24,8 @@ SOLVER_ENV_VAR = "LSSVM_SOLVER"
 SUPPORTED_SECURITY_LEVELS = {"128", "notset"}
 DEFAULT_SECURITY_LEVEL = "128"
 SECURITY_ENV_VAR = "LSSVM_SECURITY"
+
+DATASET_ENV_VAR = "LSSVM_DATASET"
 
 
 def parse_solver_name(args: list[str], env_var: str = SOLVER_ENV_VAR) -> str:
@@ -63,6 +67,27 @@ def parse_security_level(args: list[str], env_var: str = SECURITY_ENV_VAR) -> st
         supported = ", ".join(sorted(SUPPORTED_SECURITY_LEVELS))
         raise ValueError(f"Unsupported security level '{security}'. Supported: {supported}")
     return security
+
+
+def parse_dataset_name(args: list[str], env_var: str = DATASET_ENV_VAR) -> str:
+    """Resolve a dataset name from argv-style args and an optional env override."""
+    arg_dataset = None
+    for index, arg in enumerate(args):
+        if arg == "--dataset":
+            if index + 1 >= len(args):
+                raise ValueError("--dataset requires a value")
+            arg_dataset = args[index + 1]
+            break
+        if arg.startswith("--dataset="):
+            arg_dataset = arg.split("=", 1)[1]
+            break
+
+    env_dataset = os.environ.get(env_var)
+    dataset = (arg_dataset or env_dataset or DEFAULT_DATASET).strip()
+    if dataset not in SUPPORTED_DATASETS:
+        supported = ", ".join(sorted(SUPPORTED_DATASETS))
+        raise ValueError(f"Unsupported dataset '{dataset}'. Supported: {supported}")
+    return dataset
 
 
 def resolve_solver_module(solver_name: str):

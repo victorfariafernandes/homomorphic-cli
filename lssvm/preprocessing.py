@@ -24,9 +24,6 @@ from __future__ import annotations
 
 import numpy as np
 from math import factorial, sqrt
-from sklearn.datasets import load_iris
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
 
 
 # ── Kernel functions ──────────────────────────────────────────────
@@ -221,6 +218,24 @@ def build_lssvm_matrix(
     return H, rhs
 
 
+def recalibration_threshold(train_scores: np.ndarray, y_train: np.ndarray) -> float:
+    """Class-mean-midpoint decision threshold for LSSVM decision scores.
+
+    This solver's KKT variant (constant border / label rhs) yields the correct
+    separating direction but a bias that is only centred when the two classes are
+    balanced. For imbalanced problems (including every One-vs-Rest sub-problem,
+    which is 1-vs-rest and thus imbalanced) the accuracy-optimal threshold is the
+    midpoint of the per-class mean training scores rather than 0. Subtracting this
+    threshold from the decision score recovers the well-calibrated (Suykens-style)
+    decision boundary. Returns 0.0 if either class is absent.
+    """
+    pos = train_scores[y_train == 1.0]
+    neg = train_scores[y_train == -1.0]
+    if len(pos) == 0 or len(neg) == 0:
+        return 0.0
+    return float(0.5 * (pos.mean() + neg.mean()))
+
+
 def prepare_iris_binary(
     class_idx: int | None = None,
     test_size: float = 0.2,
@@ -239,28 +254,15 @@ def prepare_iris_binary(
     -------
     List of (X_train, X_test, y_train, y_test, class_name) tuples.
     y values are +1 (target class) or -1 (rest).
+
+    Back-compat wrapper: delegates to ``lssvm.preprocessors.iris.prepare_binary``.
+    New code should prefer ``lssvm.preprocessors.prepare_binary(dataset, ...)``.
     """
-    iris = load_iris()
-    X_all, y_all = iris.data, iris.target
-    class_names = iris.target_names
+    from lssvm.preprocessors import iris as iris_preparer
 
-    X_train, X_test, y_train_raw, y_test_raw = train_test_split(
-        X_all, y_all, test_size=test_size, stratify=y_all, random_state=random_state
+    return iris_preparer.prepare_binary(
+        class_idx=class_idx, test_size=test_size, random_state=random_state
     )
-
-    scaler = StandardScaler().fit(X_train)
-    X_train = scaler.transform(X_train)
-    X_test = scaler.transform(X_test)
-
-    indices = [class_idx] if class_idx is not None else range(len(class_names))
-
-    results = []
-    for c in indices:
-        y_tr = np.where(y_train_raw == c, 1.0, -1.0)
-        y_te = np.where(y_test_raw == c, 1.0, -1.0)
-        results.append((X_train, X_test, y_tr, y_te, class_names[c]))
-
-    return results
 
 
 def prepare_dataset(
