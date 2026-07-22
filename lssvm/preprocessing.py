@@ -236,6 +236,23 @@ def recalibration_threshold(train_scores: np.ndarray, y_train: np.ndarray) -> fl
     return float(0.5 * (pos.mean() + neg.mean()))
 
 
+def solve_client_plain(X_c: np.ndarray, y_c: np.ndarray, gamma: float) -> tuple[np.ndarray, float]:
+    """Solve one client's LSSVM in plaintext, returning primal (w, b).
+
+    Shared by the plaintext federated reference and the WP3 baseline (which
+    encrypts only the resulting (w, b) instead of the training data/matrix).
+    """
+    H, rhs = build_lssvm_matrix(X_c, y_c, gamma)
+    try:
+        sol = np.linalg.solve(H, rhs)
+    except np.linalg.LinAlgError:
+        sol = np.linalg.lstsq(H, rhs, rcond=None)[0]
+    b = float(sol[0])
+    alpha = sol[1:]
+    w = X_c.T @ (alpha * y_c)
+    return w, b
+
+
 def prepare_iris_binary(
     class_idx: int | None = None,
     test_size: float = 0.2,

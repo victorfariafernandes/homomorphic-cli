@@ -52,6 +52,7 @@ from lssvm.preprocessing import (
     preprocess_features,
     gcv_gamma,
     recalibration_threshold,
+    solve_client_plain,
 )
 from lssvm.preprocessors import DEFAULT_DATASET, kernel_selection, prepare_binary, raw_test_labels
 from lssvm.plain import predict_lssvm
@@ -381,14 +382,7 @@ def plaintext_federated_reference(
     w_sum = None
     b_sum = 0.0
     for X_c, y_c in partitions_feat:
-        H, rhs = build_lssvm_matrix(X_c, y_c, gamma)
-        try:
-            sol = np.linalg.solve(H, rhs)
-        except np.linalg.LinAlgError:
-            sol = np.linalg.lstsq(H, rhs, rcond=None)[0]
-        b_i = sol[0]
-        alpha_i = sol[1:]
-        w_i = X_c.T @ (alpha_i * y_c)
+        w_i, b_i = solve_client_plain(X_c, y_c, gamma)
         b_sum += b_i
         w_sum = w_i if w_sum is None else w_sum + w_i
 

@@ -58,7 +58,17 @@ def build_class_kernels(dataset: str) -> dict:
     }
 
 
-def main(k: int = 20, solver_name: str | None = None, dataset: str = DEFAULT_DATASET) -> None:
+def _model_dir(k: int, class_idx: int, model_root: str | None = None) -> str:
+    root = model_root if model_root is not None else f"models/k={k}"
+    return f"{root}/class_{class_idx}"
+
+
+def main(
+    k: int = 20,
+    solver_name: str | None = None,
+    dataset: str = DEFAULT_DATASET,
+    model_root: str | None = None,
+) -> None:
     global solv
     solv = resolve_solver_module(solver_name or DEFAULT_SOLVER_NAME)
 
@@ -76,7 +86,7 @@ def main(k: int = 20, solver_name: str | None = None, dataset: str = DEFAULT_DAT
         kernel_name, _, feature_map, _ = class_kernels.get(
             class_idx, ("linear", linear_kernel, None, "primal:linear")
         )
-        model_dir = f"models/k={k}/class_{class_idx}"
+        model_dir = _model_dir(k, class_idx, model_root)
         phi_mean = np.load(f"{model_dir}/phi_mean.npy")
         # Class-mean-midpoint threshold saved at train time (0.0 back-compat default).
         try:
@@ -134,4 +144,8 @@ if __name__ == "__main__":
         k = int(args[0])
     solver_name = parse_solver_name(sys.argv[1:])
     dataset = parse_dataset_name(sys.argv[1:])
-    main(k=k, solver_name=solver_name, dataset=dataset)
+    model_root = next(
+        (a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--model-root=")),
+        None,
+    )
+    main(k=k, solver_name=solver_name, dataset=dataset, model_root=model_root)
