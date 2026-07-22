@@ -238,7 +238,6 @@ def simulate_diag_values(A: list) -> list:
     _, R = householder_qr(A)
     return [R[i][i] for i in range(len(R[0]))]
 
-
 def _simulate_qr_signed(A: list) -> list:
     """Plaintext Householder QR with sign=sign(x0) (matching FHE solver). Returns the R matrix."""
     m, n = len(A), len(A[0])
@@ -261,7 +260,6 @@ def _simulate_qr_signed(A: list) -> list:
                 r[k + i][j] -= 2.0 * v[i] * dot
 
     return r
-
 
 def simulate_diag_bounds(A: list, diag_bounds: list = None, safety_margin: float = 0.1,
                          eps_floor: float = 1e-15) -> list:
@@ -308,6 +306,58 @@ def simulate_diag_bounds(A: list, diag_bounds: list = None, safety_margin: float
         bounds.append((lo, hi))
 
     return bounds
+
+
+def analytic_primal_bounds(n: int, d: int, gamma: float, margin: float = 1.1) -> dict:
+    """Data-independent Chebyshev domains for the primal-augmented Householder QR.
+
+    Replaces the per-run plaintext simulation (``simulate_norms`` /
+    ``simulate_diag_bounds``) used by the dual solvers. Because the primal system
+    ``H = M_aug^T M_aug`` is SPD (see ``preprocessing.build_primal_augmented``),
+    every Householder pivot magnitude ``|R[k][k]| = sqrt(norm_sq_k)`` is bounded
+    below by ``sqrt(lambda_min(H))`` with the closed-form, data-independent bound
+    ``lambda_min(H) >= 1 / (2*gamma + 2*sqrt(gamma/n) + 1/n)`` -- so a FIXED
+    reflection sign of +1 is safe at every step and no per-step data peek is
+    needed. The domains depend only on ``(n, d, gamma)``, never on the matrix
+    entries.
+
+    Bounds (validated across an exhaustive plaintext sweep of iris + breast_cancer,
+    all k in {2..40}, 6 seeds -- see the plan doc):
+
+    - ``norm_sq_k = ||x_k||^2 = R[k][k]^2`` in ``[lambda_min, n + 1/gamma]``.
+      Lower end is the proven ``lambda_min`` floor; upper end is the max column
+      norm of ``M_aug`` (column 0 has ``||y||^2 = n``; columns j>=1 have
+      ``||Phi[:,j]||^2 + 1/gamma <= n + 1/gamma`` for unit-norm feature rows, and
+      ~n for unit-variance standardized linear features).
+    - ``vtv_k`` in ``[lambda_min, 4*(n + 1/gamma)]`` (since ``vtv = 2||x||(x0+||x||)``
+      with ``|x0| <= ||x||`` gives ``vtv <= 4*norm_sq``). The lower end reuses the
+      ``lambda_min`` floor (conservative: below every observed vtv in the sweep).
+    - back-substitution pivot ``R[k][k] < 0`` (fixed sign +1 makes the diagonal
+      negative), so its inverse domain is the sign-preserving negative interval
+      ``[-sqrt(hi), -sqrt(lo)]``.
+
+    Returns a dict with keys ``sqrt``, ``inv_vtv``, ``inv_diag`` (each a
+    ``(lo, hi)`` tuple with ``lo < hi``, never crossing zero) and ``sign`` (+1.0).
+    """
+    if gamma <= 0:
+        raise ValueError(f"gamma must be > 0, got {gamma}")
+    if n < 1:
+        raise ValueError(f"n must be >= 1, got {n}")
+
+    lam_min = 1.0 / (2.0 * gamma + 2.0 * math.sqrt(gamma / n) + 1.0 / n)
+    norm_sq_lo = lam_min / margin
+    norm_sq_hi = (n + 1.0 / gamma) * margin
+
+    diag_lo = math.sqrt(norm_sq_lo)
+    diag_hi = math.sqrt(norm_sq_hi)
+
+    return {
+        "sqrt": (norm_sq_lo, norm_sq_hi),
+        "inv_vtv": (norm_sq_lo, 4.0 * norm_sq_hi),
+        # Sign-preserving negative interval for the (negative) R diagonal.
+        "inv_diag": (-diag_hi, -diag_lo),
+        "sign": 1.0,
+    }
 
 
 def random_matrix(m: int, n: int, seed: int = 42) -> list:

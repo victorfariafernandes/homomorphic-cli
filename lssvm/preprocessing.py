@@ -218,6 +218,57 @@ def build_lssvm_matrix(
     return H, rhs
 
 
+def build_primal_augmented(
+    Phi: np.ndarray,
+    y: np.ndarray,
+    gamma: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Assemble the augmented data matrix M_aug and target t for the primal solve.
+
+    This is the SPD-equivalent reformulation of ``build_lssvm_matrix``'s dual
+    system. Householder QR of M_aug solves ``min ||M_aug @ x - t||^2``, whose
+    solution ``x = [b; w]`` is byte-identical (to ~1e-13) to the dual solver's
+    recovered ``(b, w = Phi^T(alpha * y))`` -- same LSSVM problem, but the QR runs
+    on an SPD normal-equations system so every pivot is bounded below by
+    ``sqrt(lambda_min)`` and a fixed reflection sign is safe (no per-step data
+    simulation needed). See docs/superpowers/plans for the derivation.
+
+    The primal normal equations are ``H @ [b; w] = [sum(y); s]`` with
+    ``H = [[N, p^T], [p, G + I/gamma]]``, ``G = Phi^T Phi``, ``p = Phi^T y``,
+    ``s = Phi^T 1``, ``N = n``. Since ``N = y^T y`` and ``p = Phi^T y``, this
+    factors as ``H = M^T M + diag(0, 1/gamma, ...)`` with ``M = [y | Phi]``, so
+    stacking the ridge as ``d`` virtual rows gives M_aug below and the QR of the
+    tall matrix produces R = the Cholesky factor of H.
+
+    Parameters
+    ----------
+    Phi : (n, d) feature matrix (already mapped/centered/normalized per class)
+    y : (n,) labels in {-1, +1}
+    gamma : regularisation parameter (> 0)
+
+    Returns
+    -------
+    M_aug : (n + d, d + 1) augmented data matrix ``[[y, Phi], [0, sqrt(1/gamma) I]]``
+    target : (n + d,) least-squares target ``[1, ..., 1, 0, ..., 0]`` (n ones, d zeros)
+    """
+    if gamma <= 0:
+        raise ValueError(f"gamma must be > 0, got {gamma}")
+
+    Phi = np.asarray(Phi, dtype=float)
+    y = np.asarray(y, dtype=float)
+    n, d = Phi.shape
+
+    M_aug = np.zeros((n + d, d + 1))
+    M_aug[:n, 0] = y
+    M_aug[:n, 1:] = Phi
+    M_aug[n:, 1:] = np.sqrt(1.0 / gamma) * np.eye(d)
+
+    target = np.zeros(n + d)
+    target[:n] = 1.0
+
+    return M_aug, target
+
+
 def recalibration_threshold(train_scores: np.ndarray, y_train: np.ndarray) -> float:
     """Class-mean-midpoint decision threshold for LSSVM decision scores.
 
