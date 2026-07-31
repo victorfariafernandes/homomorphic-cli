@@ -19,6 +19,19 @@ EXTRA=("$@")
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 export PYTHONPATH="$REPO_ROOT"
+# NOT forcing OMP_WAIT_POLICY=passive here (measured 2026-07-30 on the cloud ARM
+# box): passive sets libgomp's spin count to 0 (GCC docs), so every idle-to-active
+# transition between the many short OMP regions in one Householder step pays a full
+# park+wake round trip -- measured ~0.87 cores/worker vs ~1.35 with the policy left
+# unset (libgomp default spin count 300000), a real +55%. It was originally set to
+# guard the fork-pool deadlock, but that is actually prevented by loading the shared
+# context single-threaded before fork() (see worker.py run_fork_pool) -- wait policy
+# was never load-bearing for that fix. Left overridable for anyone who wants to test
+# ACTIVE (30B spin, GCC default) or PASSIVE explicitly; measured no further gain from
+# ACTIVE over unset on this workload.
+if [ -n "${OMP_WAIT_POLICY:-}" ]; then
+    export OMP_WAIT_POLICY
+fi
 
 # Cloud node layout (infra/ansible/site.yml): venv + native libs.
 if [ -f /opt/lssvm/venv/bin/activate ]; then
@@ -49,32 +62,17 @@ python3 -u -m federated_lssvm.worker --k="$K" --prepare-context --threads="$NCPU
     "${EXTRA[@]}" 2>&1 | tee "$LOGDIR/prepare.log"
 T_PREPARE=$((SECONDS - T0))
 
-echo "[2/4] Launching $W workers x $THREADS threads ..."
-PIDS=()
-for i in $(seq 0 $((W - 1))); do
-    # Pin each worker to its own disjoint core block. Without this, every worker
-    # independently computes the SAME OMP spread placement (config/parallel.py sets
-    # OMP_PROC_BIND=spread), stacking all threads on ~4 cores. setdefault in
-    # init_threads keeps the values exported here.
-    if [ "$TOTAL" -le "$NCPU" ]; then
-        export OMP_PROC_BIND=close OMP_PLACES="{$((i * THREADS)):$THREADS}"
-    else
-        export OMP_PROC_BIND=false
-    fi
-    python3 -u -m federated_lssvm.worker --k="$K" --shard="$i/$W" --threads="$THREADS" \
-        "${EXTRA[@]}" > "$LOGDIR/worker_$i.log" 2>&1 &
-    PIDS+=($!)
-done
-unset OMP_PROC_BIND OMP_PLACES
-echo "  worker PIDs: ${PIDS[*]}  (logs: $LOGDIR/worker_N.log)"
-
+echo "[2/4] Fork pool: load context once, fork $W workers x $THREADS threads ..."
+# One process loads the ~big CKKS context and os.fork()s W children that share it
+# copy-on-write — instead of W processes each deserializing their own ~21 GB copy.
+# Core pinning + per-worker logs (worker_N.log) are handled inside the coordinator
+# (federated_lssvm.worker run_fork_pool), so no per-worker OMP_PLACES export here.
 FAIL=0
-for p in "${PIDS[@]}"; do
-    wait "$p" || FAIL=1
-done
+python3 -u -m federated_lssvm.worker --k="$K" --workers="$W" --threads="$THREADS" \
+    "${EXTRA[@]}" 2>&1 | tee "$LOGDIR/pool.log" || FAIL=1
 T_WORKERS=$((SECONDS - T0 - T_PREPARE))
 if [ "$FAIL" -ne 0 ]; then
-    echo "ERROR: one or more workers failed — see $LOGDIR/worker_*.log" >&2
+    echo "ERROR: fork pool failed — see $LOGDIR/worker_*.log and $LOGDIR/pool.log" >&2
     grep -l -i -E "traceback|error" "$LOGDIR"/worker_*.log >&2 || true
     exit 1
 fi

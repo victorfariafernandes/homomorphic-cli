@@ -27,6 +27,23 @@ SECURITY_ENV_VAR = "LSSVM_SECURITY"
 
 DATASET_ENV_VAR = "LSSVM_DATASET"
 
+SUPPORTED_PARTITIONS = {"iid", "dirichlet"}
+DEFAULT_PARTITION = "iid"
+PARTITION_ENV_VAR = "LSSVM_PARTITION"
+ALPHA_ENV_VAR = "LSSVM_ALPHA"
+
+
+def _extract_flag(args: list[str], flag: str) -> str | None:
+    """Return the value of `--flag value` or `--flag=value`, or None if absent."""
+    for index, arg in enumerate(args):
+        if arg == flag:
+            if index + 1 >= len(args):
+                raise ValueError(f"{flag} requires a value")
+            return args[index + 1]
+        if arg.startswith(flag + "="):
+            return arg.split("=", 1)[1]
+    return None
+
 
 def parse_solver_name(args: list[str], env_var: str = SOLVER_ENV_VAR) -> str:
     """Resolve a solver name from argv-style args and an optional environment override."""
@@ -88,6 +105,29 @@ def parse_dataset_name(args: list[str], env_var: str = DATASET_ENV_VAR) -> str:
         supported = ", ".join(sorted(SUPPORTED_DATASETS))
         raise ValueError(f"Unsupported dataset '{dataset}'. Supported: {supported}")
     return dataset
+
+
+def parse_partition_name(args: list[str], env_var: str = PARTITION_ENV_VAR) -> str:
+    """Resolve the client partitioning scheme ("iid" or "dirichlet")."""
+    arg_partition = _extract_flag(args, "--partition")
+    env_partition = os.environ.get(env_var)
+    partition = (arg_partition or env_partition or DEFAULT_PARTITION).strip()
+    if partition not in SUPPORTED_PARTITIONS:
+        supported = ", ".join(sorted(SUPPORTED_PARTITIONS))
+        raise ValueError(f"Unsupported partition '{partition}'. Supported: {supported}")
+    return partition
+
+
+def parse_alpha(args: list[str], env_var: str = ALPHA_ENV_VAR) -> float | None:
+    """Resolve the Dirichlet concentration alpha; None when unset (IID)."""
+    arg_alpha = _extract_flag(args, "--alpha")
+    raw = arg_alpha if arg_alpha is not None else os.environ.get(env_var)
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        raise ValueError(f"--alpha must be a number, got '{raw}'")
 
 
 def resolve_solver_module(solver_name: str):

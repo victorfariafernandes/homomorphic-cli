@@ -14,6 +14,7 @@ Usage (invoked by run_parallel.sh step [4/4], or manually):
 from __future__ import annotations
 
 import csv
+import glob
 import os
 import re
 import sys
@@ -27,6 +28,7 @@ _RE_TASK_RESUME = re.compile(
     r"\[worker \d+/\d+ class (\d+) (?:client (\S+)|(baseline))\] Resuming from checkpoint"
 )
 _RE_DONE = re.compile(r"\[worker \d+/\d+\] DONE: (\d+) solved, (\d+) resumed, ([\d.]+)min total")
+_RE_PEAK_RSS = re.compile(r"\[worker \d+/\d+\] PEAK RSS: ([\d.]+) MiB")
 
 _RE_CLASS_HDR = re.compile(r"--- Class (\d+) \((\S+) vs rest\)")
 _RE_FIN_SOLVE = re.compile(r"\[(?:client (\S+)|(baseline))\] FHE solve: ([\d.]+)s")
@@ -38,13 +40,43 @@ _RE_W_ERR = re.compile(r"FHE fed weights vs plaintext fed weights: ([\d.eE+-]+)"
 _RE_MULTICLASS = re.compile(r"Multiclass Accuracy \((.+?)\):\s+([\d.]+)%")
 
 
+def measure_comm_bytes(model_root: str) -> dict:
+    """Sum the per-client encrypted-weight uplink bytes under a k= model root.
+
+    Walks ``{model_root}/class_*/client_*/{weights.bin,bias.bin}`` -- exactly the
+    payload each federated client "sends" to the server -- and returns the total
+    and mean-per-upload byte counts. The single-client ``baseline`` dirs are not
+    federated traffic, so the ``client_*`` glob excludes them. ``rounds`` is 1:
+    one-shot FedAvg, versus iterative HE schemes' T rounds.
+    """
+    weight_files = glob.glob(os.path.join(model_root, "class_*", "client_*", "weights.bin"))
+    total = 0
+    for wf in weight_files:
+        total += os.path.getsize(wf)
+        bf = os.path.join(os.path.dirname(wf), "bias.bin")
+        if os.path.exists(bf):
+            total += os.path.getsize(bf)
+    n = len(weight_files)
+    return {
+        "total_bytes": total,
+        "n_uploads": n,
+        "per_client_bytes": total / n if n else 0,
+        "rounds": 1,
+    }
+
+
 def parse_worker_log(text: str) -> dict:
     """Extract context-load time, per-task solve times (None = resumed), DONE totals."""
-    w: dict = {"context_load_s": None, "tasks": {}, "solved": 0, "resumed": 0, "total_min": None}
+    w: dict = {"context_load_s": None, "tasks": {}, "solved": 0, "resumed": 0,
+               "total_min": None, "peak_rss_mib": None}
     for line in text.splitlines():
         m = _RE_CTX_LOAD.search(line)
         if m:
             w["context_load_s"] = float(m.group(2))
+            continue
+        m = _RE_PEAK_RSS.search(line)
+        if m:
+            w["peak_rss_mib"] = float(m.group(1))
             continue
         m = _RE_TASK_SOLVE.search(line)
         if m:
@@ -115,9 +147,17 @@ def generate_report(
     logs_dir: str,
     out_path: str,
     phase_seconds: dict | None = None,
+    model_root: str | None = None,
 ) -> str:
-    """Append one run section to out_path (+ rows to metrics.csv next to it)."""
+    """Append one run section to out_path (+ rows to metrics.csv next to it).
+
+    model_root: directory holding the serialized per-client checkpoints (defaults
+    to ``models/k={k}``); its ciphertext byte sizes feed the communication-cost
+    section. Skipped if the directory has no client payloads.
+    """
     phase_seconds = phase_seconds or {}
+    if model_root is None:
+        model_root = f"models/k={k}"
     workers = {}
     for fn in sorted(os.listdir(logs_dir)):
         m = re.match(r"worker_(\d+)\.log$", fn)
@@ -175,13 +215,15 @@ def generate_report(
 
     if workers:
         lines.append("\n**Per worker**\n")
-        lines.append("| worker | context load (s) | solved | resumed | total (min) |")
-        lines.append("|---|---|---|---|---|")
+        lines.append("| worker | context load (s) | solved | resumed | total (min) | peak RSS (MiB) |")
+        lines.append("|---|---|---|---|---|---|")
         for wid in sorted(workers):
             w = workers[wid]
+            rss = w.get("peak_rss_mib")
             lines.append(
                 f"| worker {wid} | {w['context_load_s'] if w['context_load_s'] is not None else 'n/a'} "
-                f"| {w['solved']} | {w['resumed']} | {w['total_min'] if w['total_min'] is not None else 'n/a'} |"
+                f"| {w['solved']} | {w['resumed']} | {w['total_min'] if w['total_min'] is not None else 'n/a'} "
+                f"| {rss if rss is not None else 'n/a'} |"
             )
 
     if client_times:
@@ -194,6 +236,17 @@ def generate_report(
             lines.append(
                 f"| {cls} | {client} | {f'{secs:.1f}' if secs is not None else 'resumed'} | {who} |"
             )
+
+    comm = measure_comm_bytes(model_root)
+    if comm["n_uploads"]:
+        lines.append("\n### Communication\n")
+        lines.append(
+            f"- Per-client uplink: {comm['per_client_bytes'] / 1024:.1f} KiB  "
+            f"(total {comm['total_bytes'] / 1024:.1f} KiB over {comm['n_uploads']} uploads)"
+        )
+        lines.append(
+            f"- **rounds={comm['rounds']}** (one-shot FedAvg; iterative HE schemes need T rounds)"
+        )
     lines.append("")
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)

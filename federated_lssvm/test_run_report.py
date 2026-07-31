@@ -21,6 +21,7 @@ WORKER_LOG = textwrap.dedent("""\
       [worker 1/4 class 2 baseline] FHE solve: 700.0s
       [worker 1/4 class 2 baseline] Checkpoint saved.
     [worker 1/4] DONE: 2 solved, 1 resumed, 21.0min total
+    [worker 1/4] PEAK RSS: 812.5 MiB
 """)
 
 FINALIZE_LOG = textwrap.dedent("""\
@@ -56,6 +57,7 @@ def test_parse_worker_log():
     assert (0, "1") in w["tasks"] and w["tasks"][(0, "1")] is None  # resumed
     assert w["tasks"][(1, "9")] == pytest.approx(551.2)
     assert w["tasks"][(2, "baseline")] == pytest.approx(700.0)
+    assert w["peak_rss_mib"] == pytest.approx(812.5)
 
 
 def test_parse_finalize_metrics():
@@ -90,10 +92,36 @@ def test_generate_report(tmp_path):
     assert "100.00" in text and "43.33" in text and "94.74" in text
     # time spent: total + phases
     assert "36.2 min" in text  # (13+1260+900)/60 total
-    # per worker
+    # per worker (incl. peak RSS)
     assert "worker 1" in text and "21.0" in text and "152.3" in text
+    assert "812.5" in text
     # per client
     assert "551.2" in text and "700.0" in text and "resumed" in text
+
+
+def test_generate_report_includes_comm_cost(tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    (logs / "worker_1.log").write_text(WORKER_LOG)
+    (logs / "finalize.log").write_text(FINALIZE_LOG)
+    # fake serialized per-client payloads under a model root
+    model_root = tmp_path / "models" / "k=40"
+    for i in range(2):
+        d = model_root / "class_0" / f"client_{i}"
+        d.mkdir(parents=True)
+        (d / "weights.bin").write_bytes(b"\0" * 2048)
+        (d / "bias.bin").write_bytes(b"\0" * 1024)
+    out = tmp_path / "report.md"
+    generate_report(
+        k=40, dataset="iris", logs_dir=str(logs), out_path=str(out),
+        phase_seconds={"prepare": 1.0, "workers": 2.0, "finalize": 3.0},
+        model_root=str(model_root),
+    )
+    text = out.read_text()
+    assert "Communication" in text
+    assert "rounds=1" in text or "1 round" in text
+    # 2 uploads x (2048+1024) = 6144 B total = 6.0 KiB
+    assert "6.0 KiB" in text
 
 
 def test_report_appends_never_replaces(tmp_path):

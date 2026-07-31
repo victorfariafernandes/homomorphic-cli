@@ -34,6 +34,8 @@ from federated_lssvm.solver_selection import (
     parse_solver_name,
     parse_security_level,
     parse_dataset_name,
+    parse_partition_name,
+    parse_alpha,
     resolve_solver_module,
 )
 from lssvm.solvers.utils import (
@@ -285,33 +287,85 @@ def _subsample_for_fhe(
 # ── core federated functions ────────────────────────────────────────
 
 
+def _dirichlet_split(idx: np.ndarray, k: int, alpha: float, rng) -> list[np.ndarray]:
+    """Allocate `idx` across k clients by Dirichlet(alpha) proportions.
+
+    Draws one proportion per client from Dirichlet(alpha * 1_k) and cuts a
+    shuffled copy of `idx` at the cumulative boundaries. Returns k index arrays
+    (some may be empty at small alpha -- that skew is the point). alpha -> inf
+    recovers a near-uniform (IID) split.
+    """
+    idx = idx.copy()
+    rng.shuffle(idx)
+    if len(idx) == 0:
+        return [np.array([], dtype=idx.dtype) for _ in range(k)]
+    p = rng.dirichlet(alpha * np.ones(k))
+    # integer cut points from cumulative proportions
+    cuts = (np.cumsum(p) * len(idx)).astype(int)[:-1]
+    return [c for c in np.split(idx, cuts)]
+
+
 def partition_all(
     X: np.ndarray,
     y: np.ndarray,
     k: int,
     base_seed: int = 42,
+    partition: str = "iid",
+    alpha: float | None = None,
 ) -> list[tuple[np.ndarray, np.ndarray]]:
     """Distribute all training samples disjointly across k clients.
 
-    Uses np.array_split so remainders are spread evenly (some clients get
-    one extra sample). Each client's partition preserves the pos/neg ratio.
+    partition="iid" (default): np.array_split spreads remainders evenly and each
+    client preserves the global pos/neg ratio.
+
+    partition="dirichlet": each of the +1 / -1 index pools is split across clients
+    by an independent Dirichlet(alpha) draw (per-OvR-binary label skew). Small
+    alpha => severe non-IID; large alpha => ~IID. A client may end up with no
+    positive (or no negative) examples -- allowed and counted, since that
+    degenerate all-one-sign local model is the non-IID pathology under study.
+    Fully-empty clients (0 total samples) would break the FHE matrix build, so
+    they are back-filled with one sample from the largest client.
     """
     rng = np.random.default_rng(base_seed)
 
     pos_idx = np.where(y == 1.0)[0].copy()
     neg_idx = np.where(y == -1.0)[0].copy()
 
-    rng.shuffle(pos_idx)
-    rng.shuffle(neg_idx)
+    if partition == "iid":
+        rng.shuffle(pos_idx)
+        rng.shuffle(neg_idx)
+        pos_chunks = np.array_split(pos_idx, k)
+        neg_chunks = np.array_split(neg_idx, k)
+    elif partition == "dirichlet":
+        if alpha is None:
+            raise ValueError("partition='dirichlet' requires alpha")
+        pos_chunks = _dirichlet_split(pos_idx, k, alpha, rng)
+        neg_chunks = _dirichlet_split(neg_idx, k, alpha, rng)
+    else:
+        raise ValueError(f"Unknown partition '{partition}' (expected iid|dirichlet)")
 
-    pos_chunks = np.array_split(pos_idx, k)
-    neg_chunks = np.array_split(neg_idx, k)
+    client_idx = [
+        np.concatenate([pos_chunks[i], neg_chunks[i]]).astype(int) for i in range(k)
+    ]
 
-    partitions = []
-    for i in range(k):
-        indices = np.sort(np.concatenate([pos_chunks[i], neg_chunks[i]]))
-        partitions.append((X[indices], y[indices]))
-    return partitions
+    # Guard: no fully-empty client (would break the downstream FHE matrix build).
+    empties = [i for i in range(k) if len(client_idx[i]) == 0]
+    for i in empties:
+        donor = int(np.argmax([len(c) for c in client_idx]))
+        client_idx[i] = client_idx[donor][-1:]
+        client_idx[donor] = client_idx[donor][:-1]
+
+    pos_set = set(pos_idx.tolist())
+    n_zero_pos = sum(
+        1 for ci in client_idx if not any(int(j) in pos_set for j in ci)
+    )
+    if n_zero_pos:
+        print(
+            f"[partition] {n_zero_pos} client(s) with no positive examples "
+            f"(partition={partition}, alpha={alpha})"
+        )
+
+    return [(X[np.sort(ci)], y[np.sort(ci)]) for ci in client_idx]
 
 
 def fhe_aggregate(cc, b_cts: list, w_cts: list) -> tuple:
@@ -398,12 +452,23 @@ def plaintext_federated_reference(
 # ── shared building blocks (used by main() and federated_lssvm.worker) ──────
 
 
-def compute_problem_dims(splits, k: int, n_per_class: int | None):
-    """Deterministic partitions + context sizing shared by train and worker processes."""
+def compute_problem_dims(
+    splits,
+    k: int,
+    n_per_class: int | None,
+    partition: str = "iid",
+    alpha: float | None = None,
+):
+    """Deterministic partitions + context sizing shared by train and worker processes.
+
+    partition/alpha select IID vs Dirichlet(alpha) non-IID client splits; they must
+    match between train.py and worker.py or the worker's checkpoints will not line up
+    with train.py's FedAvg aggregation.
+    """
     all_partitions = {}
     max_client_n = 1
     for class_idx, (X_tr, _, y_tr, _, _) in enumerate(splits):
-        parts = partition_all(X_tr, y_tr, k)
+        parts = partition_all(X_tr, y_tr, k, partition=partition, alpha=alpha)
         if n_per_class is not None:
             parts = [
                 _subsample_for_fhe(Xc, yc, n_per_class, seed=42 + class_idx * 1000 + i)
@@ -727,6 +792,8 @@ def main(
     solver_name: str | None = None,
     security: str = DEFAULT_SECURITY_LEVEL,
     dataset: str = DEFAULT_DATASET,
+    partition: str = "iid",
+    alpha: float | None = None,
 ) -> None:
     global solv
     solv = resolve_solver_module(solver_name or DEFAULT_SOLVER_NAME)
@@ -744,8 +811,9 @@ def main(
 
     # Steps 1+2: partitions (plaintext, no FHE) + context sizing (shared with worker.py)
     all_partitions, max_client_n, max_feat_dim = compute_problem_dims(
-        splits, k, n_per_class
+        splits, k, n_per_class, partition=partition, alpha=alpha
     )
+    print(f"Partition: {partition}" + (f" (alpha={alpha})" if partition == "dirichlet" else ""))
     assert_fits_bootstrap_slots(security, splits, max_client_n, max_feat_dim)
     print(f"Max client H size: {max_client_n}x{max_client_n}  (k={k})\n")
 
@@ -1003,6 +1071,8 @@ if __name__ == "__main__":
     solver_name = parse_solver_name(args)
     security = parse_security_level(args)
     dataset = parse_dataset_name(args)
+    partition = parse_partition_name(args)
+    alpha = parse_alpha(args)
     main(
         k=k,
         serialize=serialize,
@@ -1010,4 +1080,6 @@ if __name__ == "__main__":
         solver_name=solver_name,
         security=security,
         dataset=dataset,
+        partition=partition,
+        alpha=alpha,
     )

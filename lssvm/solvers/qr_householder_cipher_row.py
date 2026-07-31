@@ -321,6 +321,7 @@ def _qr(
             bootstrap=bootstrap,
             sign=s,
         )
+        print(f"[step] {k + 1}/{steps} ({100 * (k + 1) / steps:.0f}%)", flush=True)
 
     return Q_cols, R_cts, diag_bounds
 

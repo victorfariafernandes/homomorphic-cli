@@ -50,6 +50,31 @@ ansible-playbook -i ../ansible/inventory.oci.ini ../ansible/site.yml \
 
 Local-only smoke (no remote): use `infra/ansible/inventory.local.ini`.
 
+## Monitoring the campaign
+On the cloud node the `lssvm-campaign` systemd unit runs `config/run_campaign.sh`
+(pytest gate + the iris/breast_cancer × {iid, dirichlet} sweep). Set `IP`/`KEY` to the
+instance, then:
+
+```bash
+IP=<public-ip> ; KEY=~/.ssh/<key>
+
+# campaign progress (per-config OK/FAIL, pytest, sizing)
+ssh -i $KEY ubuntu@$IP 'tail -f /opt/lssvm/app/campaign_results/campaign.log'
+
+# ALL worker logs, live + completed, one header per worker
+ssh -i $KEY ubuntu@$IP '
+  find /opt/lssvm/app/models /opt/lssvm/app/campaign_results -name "worker_*.log" 2>/dev/null \
+    | sort | xargs -r tail -n +1 -v'
+
+# follow the CURRENTLY-running workers (re-run at each new config / k-dir)
+ssh -i $KEY ubuntu@$IP 'tail -n +1 -f /opt/lssvm/app/models/k=*/logs/worker_*.log'
+```
+
+Worker logs live at `models/k=<K>/logs/worker_*.log` while a config runs, then move to
+`campaign_results/<config>/logs/` when it finishes. Final artifacts (`all_metrics.csv`,
+`SUMMARY.md`, `campaign_results.tar.gz`) land in `campaign_results/`. To confirm OpenMP is
+actually engaging on the node: `python -m config.omp_smoke` (PASS = parallel, FAIL = serial).
+
 ## Conventions
 - package-per-concern, no flat scripts at root except `activate_env.sh`
 - `git mv` for moves, preserve history

@@ -14,6 +14,34 @@ import sys
 
 DEFAULT_THREADS = int(os.environ.get("FHE_DEFAULT_THREADS", "6"))
 
+# OpenMP runtime candidates across platforms/toolchains (libgomp on Linux, LLVM
+# libomp on macOS/clang). Used to set the thread count at runtime — needed by the
+# fork pool, which loads the context single-threaded then bumps each child's pool.
+_OMP_LIBS = (
+    "libgomp.so.1",
+    "libomp.so",
+    "libomp.dylib",
+    "/opt/homebrew/opt/libomp/lib/libomp.dylib",
+    "/usr/local/opt/libomp/lib/libomp.dylib",
+)
+
+
+def set_omp_threads(n: int) -> bool:
+    """Call omp_set_num_threads(n) via whichever OMP runtime is loadable.
+
+    Returns True if the runtime API was reached (so the change takes effect even
+    after OpenMP has middle-initialized, which env vars can no longer influence).
+    """
+    for name in _OMP_LIBS:
+        try:
+            lib = ctypes.CDLL(name)
+            lib.omp_set_num_threads.argtypes = [ctypes.c_int]
+            lib.omp_set_num_threads(int(n))
+            return True
+        except (OSError, AttributeError):
+            continue
+    return False
+
 
 def _parse_threads_arg(argv: list[str]) -> tuple[int | None, list[str]]:
     """Extract --threads=N from argv. Returns (n_or_None, remaining_argv)."""
@@ -49,12 +77,7 @@ def init_threads(n: int | None = None) -> int:
     os.environ.setdefault("OMP_PLACES", "cores")
     os.environ["OPENBLAS_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
-    try:
-        libgomp = ctypes.CDLL("libgomp.so.1")
-        libgomp.omp_set_num_threads.argtypes = [ctypes.c_int]
-        libgomp.omp_set_num_threads(n)
-    except OSError:
-        pass
+    set_omp_threads(n)
     return n
 
 

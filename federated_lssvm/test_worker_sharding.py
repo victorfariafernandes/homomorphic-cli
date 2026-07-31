@@ -30,19 +30,31 @@ def test_shards_are_disjoint_and_complete(num_shards):
 
 
 def test_parse_args_shard():
-    k, shard, prepare, n_per_class = _parse_args(["--k=40", "--shard=3/16"])
-    assert (k, shard, prepare, n_per_class) == (40, (3, 16), False, None)
+    k, shard, prepare, n_per_class, workers = _parse_args(["--k=40", "--shard=3/16"])
+    assert (k, shard, prepare, n_per_class, workers) == (40, (3, 16), False, None, None)
 
 
 def test_parse_args_prepare_context():
-    k, shard, prepare, n_per_class = _parse_args(
+    k, shard, prepare, n_per_class, workers = _parse_args(
         ["--k=3", "--prepare-context", "--n-per-class=2"]
     )
-    assert (k, shard, prepare, n_per_class) == (3, None, True, 2)
+    assert (k, shard, prepare, n_per_class, workers) == (3, None, True, 2, None)
+
+
+def test_parse_args_workers():
+    k, shard, prepare, n_per_class, workers = _parse_args(["--k=40", "--workers=12"])
+    assert (k, shard, prepare, n_per_class, workers) == (40, None, False, None, 12)
 
 
 def test_parse_args_ignores_solver_and_security():
-    k, shard, _, _ = _parse_args(["--k=3", "--shard=0/3", "--solver=qr_row", "--security=notset"])
+    k, shard, *_ = _parse_args(["--k=3", "--shard=0/3", "--solver=qr_row", "--security=notset"])
+    assert (k, shard) == (3, (0, 3))
+
+
+def test_parse_args_tolerates_partition_and_alpha():
+    # partition/alpha are resolved in worker.main() via solver_selection (like
+    # solver/security/dataset), not by _parse_args -- passing them must not break it.
+    k, shard, *_ = _parse_args(["--k=3", "--shard=0/3", "--partition=dirichlet", "--alpha=0.5"])
     assert (k, shard) == (3, (0, 3))
 
 
@@ -52,9 +64,37 @@ def test_parse_args_rejects_out_of_range_shard(bad):
         _parse_args(["--k=40", bad])
 
 
-def test_parse_args_requires_shard_or_prepare():
+def test_parse_args_rejects_zero_workers():
+    with pytest.raises(SystemExit):
+        _parse_args(["--k=40", "--workers=0"])
+
+
+def test_parse_args_requires_a_mode():
     with pytest.raises(SystemExit):
         _parse_args(["--k=40"])
+
+
+@pytest.mark.parametrize("combo", [
+    ["--shard=0/3", "--workers=3"],
+    ["--shard=0/3", "--prepare-context"],
+    ["--workers=3", "--prepare-context"],
+])
+def test_parse_args_rejects_multiple_modes(combo):
+    with pytest.raises(SystemExit):
+        _parse_args(["--k=40", *combo])
+
+
+@pytest.mark.parametrize("workers", [1, 3, 12, 16])
+def test_fork_pool_shards_match_separate_processes(workers):
+    """The --workers=W fork pool runs run_shard(shard_idx=i, num_shards=W) per child,
+    so its per-child task slices must union to the full list with no overlap/gaps —
+    identical coverage to W separate --shard=i/W processes."""
+    tasks = task_list(3, 40)
+    per_child = [tasks[i::workers] for i in range(workers)]
+    combined = [t for child in per_child for t in child]
+    assert sorted(map(str, combined)) == sorted(map(str, tasks))
+    assert len(combined) == len(tasks)
+    assert max(len(c) for c in per_child) - min(len(c) for c in per_child) <= 1
 
 
 # ── context marker: must survive save_global_checkpoint's checkpoint.json ──
