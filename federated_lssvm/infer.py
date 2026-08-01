@@ -17,6 +17,7 @@ from federated_lssvm.solver_selection import (
     DEFAULT_SOLVER_NAME,
     parse_dataset_name,
     parse_solver_name,
+    parse_models_root,
     resolve_solver_module,
 )
 from lssvm.preprocessing import (
@@ -144,8 +145,6 @@ if __name__ == "__main__":
         k = int(args[0])
     solver_name = parse_solver_name(sys.argv[1:])
     dataset = parse_dataset_name(sys.argv[1:])
-    model_root = next(
-        (a.split("=", 1)[1] for a in sys.argv[1:] if a.startswith("--model-root=")),
-        None,
-    )
+    models_root = parse_models_root(sys.argv[1:])
+    model_root = f"{models_root}/k={k}" if models_root != "models" else None
     main(k=k, solver_name=solver_name, dataset=dataset, model_root=model_root)

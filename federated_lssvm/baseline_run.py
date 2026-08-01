@@ -29,9 +29,11 @@ import federated_lssvm.train as T
 from federated_lssvm.solver_selection import (
     DEFAULT_SOLVER_NAME,
     DEFAULT_SECURITY_LEVEL,
+    DEFAULT_MODELS_ROOT,
     parse_solver_name,
     parse_security_level,
     parse_dataset_name,
+    parse_models_root,
     resolve_solver_module,
 )
 from lssvm.preprocessing import (
@@ -127,6 +129,7 @@ def main(
     security: str = DEFAULT_SECURITY_LEVEL,
     dataset: str = DEFAULT_DATASET,
     serialize: bool = True,
+    models_root: str = DEFAULT_MODELS_ROOT,
 ) -> None:
     global solv
     solv = resolve_solver_module(solver_name or DEFAULT_SOLVER_NAME)
@@ -240,7 +243,7 @@ def main(
         )
 
         if serialize:
-            out_dir = f"models/k={k}_baseline/class_{class_idx}"
+            out_dir = f"{models_root}/k={k}_baseline/class_{class_idx}"
             solv.save_global_checkpoint(
                 cc,
                 keys,
@@ -271,14 +274,17 @@ def main(
         ovr_acc = float(np.mean(ovr_preds == y_test_raw) * 100)
         _log(f"OvR Multiclass Accuracy (Baseline, k={k}): {ovr_acc:.2f}%")
 
-    logs_dir = f"models/k={k}_baseline/logs"
+    logs_dir = f"{models_root}/k={k}_baseline/logs"
     os.makedirs(logs_dir, exist_ok=True)
     with open(f"{logs_dir}/finalize.log", "w", encoding="utf-8") as f:
         f.write("\n".join(_LOG_LINES) + "\n")
 
     from config.report import generate_report
 
-    report_path = generate_report(k, dataset, logs_dir, f"models/k={k}_baseline/report.md")
+    report_path = generate_report(
+        k, dataset, logs_dir, f"{models_root}/k={k}_baseline/report.md",
+        model_root=f"{models_root}/k={k}_baseline",
+    )
     print(f"[baseline_run] appended run section to {report_path}")
 
 
@@ -292,4 +298,8 @@ if __name__ == "__main__":
     solver_name = parse_solver_name(args)
     security = parse_security_level(args)
     dataset = parse_dataset_name(args)
-    main(k=k, solver_name=solver_name, security=security, dataset=dataset, serialize=serialize)
+    models_root = parse_models_root(args)
+    main(
+        k=k, solver_name=solver_name, security=security, dataset=dataset,
+        serialize=serialize, models_root=models_root,
+    )

@@ -32,6 +32,9 @@ DEFAULT_PARTITION = "iid"
 PARTITION_ENV_VAR = "LSSVM_PARTITION"
 ALPHA_ENV_VAR = "LSSVM_ALPHA"
 
+DEFAULT_MODELS_ROOT = "models"
+MODELS_ROOT_ENV_VAR = "LSSVM_MODELS_ROOT"
+
 
 def _extract_flag(args: list[str], flag: str) -> str | None:
     """Return the value of `--flag value` or `--flag=value`, or None if absent."""
@@ -128,6 +131,20 @@ def parse_alpha(args: list[str], env_var: str = ALPHA_ENV_VAR) -> float | None:
         return float(raw)
     except ValueError:
         raise ValueError(f"--alpha must be a number, got '{raw}'")
+
+
+def parse_models_root(args: list[str], env_var: str = MODELS_ROOT_ENV_VAR) -> str:
+    """Resolve the output root directory for serialized models (default "models").
+
+    Lets concurrent/sequential runs with the same k (e.g. different datasets or
+    partition schemes) write to separate trees instead of colliding under models/k=N/.
+    """
+    arg_root = _extract_flag(args, "--models-root")
+    env_root = os.environ.get(env_var)
+    root = (arg_root or env_root or DEFAULT_MODELS_ROOT).strip()
+    if not root:
+        raise ValueError("models root cannot be empty")
+    return root.rstrip("/")
 
 
 def resolve_solver_module(solver_name: str):

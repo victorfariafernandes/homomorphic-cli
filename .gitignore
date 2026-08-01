@@ -61,6 +61,8 @@ logs/
 
 # Models / data
 models/
+models_*/
+artifacts/
 data/
 datasets/
 *.pickle

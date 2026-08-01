@@ -39,6 +39,7 @@ from federated_lssvm.solver_selection import (
     parse_security_level,
     parse_partition_name,
     parse_alpha,
+    parse_models_root,
     resolve_solver_module,
 )
 import federated_lssvm.train as T
@@ -87,6 +88,7 @@ def task_list(n_classes: int, k: int) -> list[tuple[int, int | str]]:
 
 def _load_context_or_die(
     context_dir, depth, security, k, max_client_n, n_test, max_feat_dim, tag,
+    models_root="models",
 ):
     """Verify the shared context exists with a matching security marker, then load it.
 
@@ -102,7 +104,7 @@ def _load_context_or_die(
         raise SystemExit(
             f"[{tag}] Context at {context_dir} has security={marker!r} but this run "
             f"requested security={security!r} — re-run --prepare-context (or move "
-            f"models/k={k} aside) before sharding"
+            f"{models_root}/k={k} aside) before sharding"
         )
     print(f"[{tag}] Loading shared context from {context_dir} ...")
     t0 = time.perf_counter()
@@ -123,6 +125,7 @@ def _peak_rss_mib() -> float:
 
 def run_shard(
     cc, keys, splits, all_partitions, k, shard_idx, num_shards, security,
+    models_root="models",
 ) -> None:
     """Solve this shard's slice of the deterministic task list into the shared
     checkpoint layout. Idempotent: tasks with a finite existing checkpoint are skipped.
@@ -145,7 +148,7 @@ def run_shard(
         if c not in setups:
             setups[c] = T.class_setup(c, splits[c][0], splits[c][2], verbose=False)
         _, feature_map, _, gamma, _, phi_mean = setups[c]
-        class_dir = f"models/k={k}/class_{c}"
+        class_dir = f"{models_root}/k={k}/class_{c}"
 
         if i == "baseline":
             X_s_feat, y_s, _ = T.baseline_features(
@@ -184,6 +187,7 @@ def run_shard(
 
 def run_fork_pool(
     cc, keys, splits, all_partitions, k, workers, security, threads, log_dir,
+    models_root="models",
 ) -> int:
     """Fork W children that each run one shard against the SAME already-loaded context.
 
@@ -222,7 +226,10 @@ def run_fork_pool(
                     # live (matches the separate-process monitoring workflow).
                     sys.stdout.reconfigure(line_buffering=True)
                     sys.stderr.reconfigure(line_buffering=True)
-                run_shard(cc, keys, splits, all_partitions, k, i, workers, security)
+                run_shard(
+                    cc, keys, splits, all_partitions, k, i, workers, security,
+                    models_root=models_root,
+                )
             except BaseException:
                 traceback.print_exc()
                 sys.stderr.flush()
@@ -258,6 +265,7 @@ def main() -> None:
     dataset = parse_dataset_name(args)
     partition = parse_partition_name(args)
     alpha = parse_alpha(args)
+    models_root = parse_models_root(args)
     T.solv = resolve_solver_module(solver_name or DEFAULT_SOLVER_NAME)
 
     # Must match train.py: configure the same kernel map, load the same splits, AND
@@ -271,7 +279,7 @@ def main() -> None:
     )
     T.assert_fits_bootstrap_slots(security, splits, max_client_n, max_feat_dim)
     depth = T.context_depth(max_client_n, security)
-    context_dir = f"models/k={k}/class_0"
+    context_dir = f"{models_root}/k={k}/class_0"
 
     if prepare_context:
         if T._class_context_exists(context_dir, depth) and (
@@ -279,7 +287,7 @@ def main() -> None:
         ):
             print(f"[prepare-context] Reusing existing context at {context_dir}")
             return
-        T.assert_safe_to_create_context(k)
+        T.assert_safe_to_create_context(k, models_root)
         print(f"[prepare-context] Creating shared context (depth={depth}, security={security}) ...")
         t0 = time.perf_counter()
         cc, keys = T.solv.setup_crypto_context(
@@ -310,20 +318,24 @@ def main() -> None:
         init_threads(1)
         cc, keys = _load_context_or_die(
             context_dir, depth, security, k, max_client_n, n_test, max_feat_dim,
-            tag=f"pool {workers}w",
+            tag=f"pool {workers}w", models_root=models_root,
         )
         rc = run_fork_pool(
             cc, keys, splits, all_partitions, k, workers, security, threads,
-            log_dir=f"models/k={k}/logs",
+            log_dir=f"{models_root}/k={k}/logs", models_root=models_root,
         )
         raise SystemExit(rc)
 
     shard_idx, num_shards = shard
     tag = f"worker {shard_idx}/{num_shards}"
     cc, keys = _load_context_or_die(
-        context_dir, depth, security, k, max_client_n, n_test, max_feat_dim, tag
+        context_dir, depth, security, k, max_client_n, n_test, max_feat_dim, tag,
+        models_root=models_root,
     )
-    run_shard(cc, keys, splits, all_partitions, k, shard_idx, num_shards, security)
+    run_shard(
+        cc, keys, splits, all_partitions, k, shard_idx, num_shards, security,
+        models_root=models_root,
+    )
 
 
 if __name__ == "__main__":

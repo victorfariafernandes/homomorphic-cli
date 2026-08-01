@@ -8,7 +8,8 @@ history accumulates across runs.
 
 Usage (invoked by run_parallel.sh step [4/4], or manually):
   python3 -m config.report --k=40 --dataset=iris --logs=models/k=40/logs \
-      [--out=models/k=40/report.md] [--prepare-s=13 --workers-s=1260 --finalize-s=900]
+      [--out=models/k=40/report.md] [--prepare-s=13 --workers-s=1260 --finalize-s=900] \
+      [--models-root=models] [--model-root=models/k=40]
 """
 
 from __future__ import annotations
@@ -283,14 +284,16 @@ def main() -> None:
 
     k = int(_get("k", "3"))
     dataset = _get("dataset", "iris")
-    logs_dir = _get("logs", f"models/k={k}/logs")
-    out_path = _get("out", f"models/k={k}/report.md")
+    models_root = _get("models-root", "models")
+    logs_dir = _get("logs", f"{models_root}/k={k}/logs")
+    out_path = _get("out", f"{models_root}/k={k}/report.md")
+    model_root = _get("model-root", f"{models_root}/k={k}")
     phases = {}
     for phase in ("prepare", "workers", "finalize"):
         v = _get(f"{phase}-s")
         if v is not None:
             phases[phase] = float(v)
-    path = generate_report(k, dataset, logs_dir, out_path, phase_seconds=phases)
+    path = generate_report(k, dataset, logs_dir, out_path, phase_seconds=phases, model_root=model_root)
     print(f"[report] appended run section to {path}")
 
 

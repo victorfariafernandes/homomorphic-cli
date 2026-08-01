@@ -6,6 +6,9 @@
 #   config/run_parallel.sh <k> <workers> <threads_per_worker> [extra args]
 #   e.g. config/run_parallel.sh 40 16 4 --solver=qr_row --security=128
 #        config/run_parallel.sh 3 3 2 --solver=qr_row --security=notset   # local test
+#        config/run_parallel.sh 40 5 2 --dataset=breast_cancer --models-root=models_bc
+#            # --models-root avoids colliding with an existing models/k=40/ from a
+#            # different dataset/partition run at the same k (default: "models").
 #
 # Preemption/interruption-safe: rerunning the same command resumes from checkpoints.
 set -euo pipefail
@@ -46,7 +49,14 @@ if [ "$TOTAL" -gt "$NCPU" ]; then
     echo "WARNING: $W workers x $THREADS threads = $TOTAL > $NCPU cores (oversubscribed)" >&2
 fi
 
-LOGDIR="models/k=${K}/logs"
+# Models root (default matches federated_lssvm.solver_selection.DEFAULT_MODELS_ROOT)
+# — lets concurrent/sequential runs with the same k avoid colliding under models/k=N/.
+MODELS_ROOT="models"
+for a in "${EXTRA[@]}"; do
+    case "$a" in --models-root=*) MODELS_ROOT="${a#--models-root=}" ;; esac
+done
+
+LOGDIR="${MODELS_ROOT}/k=${K}/logs"
 mkdir -p "$LOGDIR"
 
 # Dataset name for the run report (default matches federated_lssvm defaults).
@@ -84,5 +94,5 @@ T_FINALIZE=$((SECONDS - T0 - T_PREPARE - T_WORKERS))
 
 echo "[4/4] Appending run report ..."
 python3 -m config.report --k="$K" --dataset="$DATASET" --logs="$LOGDIR" \
-    --out="models/k=${K}/report.md" \
+    --out="${MODELS_ROOT}/k=${K}/report.md" --models-root="$MODELS_ROOT" \
     --prepare-s="$T_PREPARE" --workers-s="$T_WORKERS" --finalize-s="$T_FINALIZE"

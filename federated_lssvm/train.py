@@ -36,6 +36,7 @@ from federated_lssvm.solver_selection import (
     parse_dataset_name,
     parse_partition_name,
     parse_alpha,
+    parse_models_root,
     resolve_solver_module,
 )
 from lssvm.solvers.utils import (
@@ -146,7 +147,7 @@ def _read_checkpoint_depth(class_dir: str) -> int | None:
     return _read_marker_depth(f"{class_dir}/checkpoint.json")
 
 
-def assert_safe_to_create_context(k: int) -> None:
+def assert_safe_to_create_context(k: int, models_root: str = "models") -> None:
     """Refuse to generate fresh keys while artifacts from a previous context exist.
 
     A new secret key silently orphans existing per-client checkpoints: they still
@@ -155,7 +156,7 @@ def assert_safe_to_create_context(k: int) -> None:
     """
     import glob
 
-    base = f"models/k={k}"
+    base = f"{models_root}/k={k}"
     stale = sorted(
         glob.glob(f"{base}/class_*/client_*/weights.bin")
         + glob.glob(f"{base}/class_*/baseline/weights.bin")
@@ -794,6 +795,7 @@ def main(
     dataset: str = DEFAULT_DATASET,
     partition: str = "iid",
     alpha: float | None = None,
+    models_root: str = "models",
 ) -> None:
     global solv
     solv = resolve_solver_module(solver_name or DEFAULT_SOLVER_NAME)
@@ -819,7 +821,7 @@ def main(
 
     # Step 3: One shared crypto context for all clients and all classes
     depth = context_depth(max_client_n, security)
-    class_dirs = [f"models/k={k}/class_{class_idx}" for class_idx in range(len(splits))]
+    class_dirs = [f"{models_root}/k={k}/class_{class_idx}" for class_idx in range(len(splits))]
     existing_ctx_dir = next(
         (
             class_dir
@@ -840,7 +842,7 @@ def main(
             existing_ctx_dir, max_client_n, n_test, max_feat_dim
         )
     else:
-        assert_safe_to_create_context(k)
+        assert_safe_to_create_context(k, models_root)
         print(f"Setting up shared crypto context (depth={depth}, security={security}) ...")
         t_ctx = time.perf_counter()
         cc, keys = solv.setup_crypto_context(
@@ -912,7 +914,7 @@ def main(
         parts = all_partitions[class_idx]
         b_cts, w_cts = [], []
         parts_feat = []
-        class_dir = f"models/k={k}/class_{class_idx}"
+        class_dir = f"{models_root}/k={k}/class_{class_idx}"
         if not _class_context_exists(class_dir, depth):
             _save_class_context(class_dir, cc, keys, depth, security=security)
         for client_id, (X_c, y_c) in enumerate(parts):
@@ -920,7 +922,7 @@ def main(
             # normalization is per-row, so client rows match the full-data frame.
             X_c_feat, _ = preprocess_features(X_c, feature_map, phi_mean=phi_mean)
             parts_feat.append((X_c_feat, y_c))
-            ckpt_dir = f"models/k={k}/class_{class_idx}/client_{client_id}"
+            ckpt_dir = f"{models_root}/k={k}/class_{class_idx}/client_{client_id}"
             b_ct_i, w_ct_i = solve_client_checkpointed(
                 cc, keys, ckpt_dir, X_c_feat, y_c, gamma, security,
                 label=f"client {client_id}",
@@ -1005,7 +1007,7 @@ def main(
 
         # Serialize global model
         if serialize:
-            out_dir = f"models/k={k}/class_{class_idx}"
+            out_dir = f"{models_root}/k={k}/class_{class_idx}"
             solv.save_global_checkpoint(
                 cc,
                 keys,
@@ -1073,6 +1075,7 @@ if __name__ == "__main__":
     dataset = parse_dataset_name(args)
     partition = parse_partition_name(args)
     alpha = parse_alpha(args)
+    models_root = parse_models_root(args)
     main(
         k=k,
         serialize=serialize,
@@ -1082,4 +1085,5 @@ if __name__ == "__main__":
         dataset=dataset,
         partition=partition,
         alpha=alpha,
+        models_root=models_root,
     )
