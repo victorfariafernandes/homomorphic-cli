@@ -8,8 +8,10 @@ Least-Squares SVM training + inference over CKKS-encrypted data using OpenFHE. I
 - `federated_lssvm/` — multi-party training + inference
 - `config/` — run script, metrics, shared init helpers (parallel)
 - `requirements.txt`, `pytest.ini`, `activate_env.sh` — dev tooling
+- `paper_run.sh` — reproduces the paper's reported results
 
 ## Entry points
+- `./paper_run.sh` — reproduces the paper's reported experiments end to end
 - `bash config/run.sh [module] [args]` — top-level threaded runner
 - `python -m federated_lssvm.train` — federated training
 - `python -m federated_lssvm.infer` — federated inference
@@ -81,13 +83,16 @@ Quick sanity check, no OpenFHE build needed (seconds):
 pytest lssvm
 ```
 
-Full experiment suite (needs the OpenFHE build above):
+Full experiment suite — reproduces the paper's reported results (needs the
+OpenFHE build above):
 ```bash
-bash config/run_campaign.sh
+./paper_run.sh
 ```
 Sweeps iris + breast_cancer across IID and Dirichlet non-IID partitions
-(`alpha` in `{0.5, 0.05}`) at 128-bit security. Per-run metrics land in
-`campaign_results/<config>/report.md`, aggregated into
+(`alpha` in `{0.5, 0.05}`) at 128-bit security — these are `paper_run.sh`'s
+fixed defaults (a thin wrapper around `config/run_campaign.sh`, which stays
+tunable via env vars for anything beyond exact paper reproduction). Per-run
+metrics land in `campaign_results/<config>/report.md`, aggregated into
 `campaign_results/all_metrics.csv` and `campaign_results/SUMMARY.md`. Sizes
 itself to the machine's core/RAM budget; expect on the order of hours on a
 modest multi-core machine. Worker logs live at `models/k=<K>/logs/worker_*.log`
@@ -96,7 +101,7 @@ while a config runs, then move to `campaign_results/<config>/logs/` when done.
 Fast pipeline smoke test, minutes, insecure `notset` crypto params — validates
 the pipeline shape, not the reported accuracy/security numbers:
 ```bash
-SECURITY=notset ALPHAS="0.5" bash config/run_campaign.sh
+SECURITY=notset ALPHAS="0.5" ./paper_run.sh
 ```
 
 All train/test splits use a fixed seed (`random_state=42`), so plaintext
