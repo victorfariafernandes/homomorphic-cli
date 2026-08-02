@@ -22,15 +22,10 @@ def test_solve_client_plain_matches_manual_solve():
 
 
 def test_solve_client_plain_returns_correct_shapes_and_types():
-    # NOTE: this LSSVM formulation's zero-sum constraint on alpha (the H
-    # matrix's constant border row/col) means class-BALANCED, well-separated
-    # synthetic data can drive alpha_i -> y_i, collapsing w = X^T(alpha*y) ->
-    # X^T*1 -> ~0 for symmetric clusters (verified against the pre-existing
-    # inlined formula in train.py, so this is a property of the algorithm,
-    # not this refactor). Every real caller partitions imbalanced per-class
-    # OvR problems (see partition_all's "preserves the pos/neg ratio"), so a
-    # shape/type check here is the right-weight test; exact numerical
-    # correctness is already fully pinned by the test above.
+    # Balanced, well-separated synthetic data collapses w -> ~0 under this LSSVM's
+    # zero-sum alpha constraint (an algorithm property, not a bug). Real callers
+    # only ever pass imbalanced per-class OvR splits, so this test checks
+    # shape/type only; exact numerics are pinned by the test above.
     rng = np.random.default_rng(2)
     X = rng.normal(size=(8, 5))
     y = np.array([1.0, 1.0, 1.0, -1.0, -1.0, 1.0, -1.0, -1.0])

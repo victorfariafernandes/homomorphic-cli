@@ -1,3 +1,7 @@
+import pytest
+
+pytest.importorskip("openfhe", reason="requires the OpenFHE C++/Python build")
+
 import federated_lssvm.train as T
 from lssvm.preprocessors import prepare_binary
 

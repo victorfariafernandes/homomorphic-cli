@@ -40,6 +40,38 @@ source activate_env.sh
 pip install -r requirements.txt
 pytest
 ```
+Tested on Python 3.11. `federated_lssvm/` tests that exercise the encrypted path
+require the OpenFHE C++/Python build (see Deploy below) and are skipped
+automatically when `openfhe` isn't importable — `pytest lssvm` alone runs on
+plain `numpy`/`scipy`/`scikit-learn`, no OpenFHE build needed.
+
+## Reproducing results
+Quick sanity check, no OpenFHE build needed (seconds):
+```bash
+pytest lssvm
+```
+
+Full experiment suite (needs OpenFHE — build via `infra/ansible/site.yml`,
+locally with `inventory.local.ini` or on a cloud node per Deploy below):
+```bash
+bash config/run_campaign.sh
+```
+Sweeps iris + breast_cancer across IID and Dirichlet non-IID partitions
+(`alpha` in `{0.5, 0.05}`) at 128-bit security. Per-run metrics land in
+`campaign_results/<config>/report.md`, aggregated into
+`campaign_results/all_metrics.csv` and `campaign_results/SUMMARY.md`. Expect
+on the order of hours on a multi-core instance (see `infra/terraform` for the
+reference cloud shape).
+
+Fast pipeline smoke test, minutes, insecure `notset` crypto params — validates
+the pipeline shape, not the reported accuracy/security numbers:
+```bash
+SECURITY=notset ALPHAS="0.5" bash config/run_campaign.sh
+```
+
+All train/test splits use a fixed seed (`random_state=42`), so plaintext
+metrics reproduce exactly; encrypted-path numbers reproduce to CKKS's
+approximate-arithmetic tolerance.
 
 ## Deploy
 ```bash
@@ -81,3 +113,6 @@ actually engaging on the node: `python -m config.omp_smoke` (PASS = parallel, FA
 - no algorithm changes in structural commits
 - import paths: `lssvm.*`, `federated_lssvm.*`, `config.*` (no flat `lssvm_*`/`fhe_*` prefixes)
 - Federated global checkpoints persist `secret_key.bin`; `public_key.bin` is optional.
+
+## License / citation
+MIT — see `LICENSE`. If you use this code, please cite it via `CITATION.cff`.

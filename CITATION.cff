@@ -1,0 +1,14 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata below."
+type: software
+title: "lwe: Privacy-Preserving LSSVM via Homomorphic Encryption (CKKS/OpenFHE)"
+authors:
+  - family-names: Fernandes
+    given-names: Victor Faria
+    email: victorfariafernandes@gmail.com
+repository-code: "https://github.com/victorffernandes/homomorphic-cli"
+license: MIT
+abstract: >
+  Least-squares SVM training and inference over CKKS-encrypted data using
+  OpenFHE, including a federated variant (FedAvg) for multi-party training
+  without sharing plaintext.

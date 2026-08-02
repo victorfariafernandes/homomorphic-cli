@@ -306,14 +306,11 @@ def main() -> None:
         return
 
     if workers is not None:
-        # Fork pool: load the context once, then fork W children that share it
-        # copy-on-write (see fork-pool plan). Each child runs one shard.
-        #
-        # Load SINGLE-THREADED: fork() does not duplicate OpenMP worker threads, so a
-        # pool created before the fork leaves the children with stale thread state and
-        # they deadlock on their first parallel region. Loading at 1 thread means no
-        # worker pool exists at fork; each child then spins up its own fresh pool at
-        # `threads` inside run_fork_pool.
+        # Fork pool: load the context once (single-threaded), then fork W children
+        # that share it copy-on-write. Loading single-threaded is required: fork()
+        # doesn't duplicate OpenMP worker threads, so a pool created before the fork
+        # leaves children with stale thread state that deadlocks on first use. Each
+        # child spins up its own fresh pool at `threads` inside run_fork_pool.
         threads = init_threads()  # requested per-worker threads (from --threads)
         init_threads(1)
         cc, keys = _load_context_or_die(

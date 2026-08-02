@@ -29,12 +29,9 @@ EMPIRICAL_MAX_ABS_DIAG = 15.1
     [(6, 4.2), (40, 1.1), (227, 1.1), (24, 1.27), (60, 3.9)],
 )
 def test_floors_below_proven_lambda_min(n, gamma):
-    # The proven property is ``norm_sq_k = R[k][k]^2 >= lambda_min(H)`` PER CONFIG
-    # (Cholesky pivots dominate lambda_min by Cauchy interlacing). Since the floor
-    # is ``lambda_min / margin < lambda_min``, it is strictly below every possible
-    # pivot for that config -- the correct safety comparison (not against the
-    # cross-config global minimum, which comes from a higher-gamma config where
-    # lambda_min is smaller).
+    # Proven property (Cauchy interlacing): R[k][k]^2 >= lambda_min(H) PER CONFIG.
+    # So the floor (lambda_min/margin) must be compared against this config's own
+    # lambda_min, not the cross-config global minimum from a different gamma.
     lam_min = 1.0 / (2.0 * gamma + 2.0 * math.sqrt(gamma / n) + 1.0 / n)
     b = analytic_primal_bounds(n, d=15, gamma=gamma)
     assert b["sqrt"][0] < lam_min

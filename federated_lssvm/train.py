@@ -65,8 +65,13 @@ from config.metrics import weight_relative_error
 solv = None
 
 # ── configuration ──────────────────────────────────────────────────
-D_SQRT = 2
-D_INV = 2
+# D_SQRT/D_INV were 2, but that Chebyshev degree's ~3% per-step error compounds
+# on high-condition-number matrices (breast_cancer, cond 300-450+) enough to
+# overflow the domain simulate_diag_bounds() calibrates for he_back_substitute,
+# causing CKKS decode failures regardless of security level or ring dimension.
+# Degree 8 fixes it (~1e-4 relative error, zero iris regression) at added depth cost.
+D_SQRT = 8
+D_INV = 8
 D_INV_BACKSUB = 8
 DEPTH_SAFETY = 1.20
 DEPTH_OVERRIDE = None
@@ -1021,13 +1026,6 @@ def main(
             np.save(f"{out_dir}/phi_mean.npy", phi_mean)
             np.save(f"{out_dir}/threshold.npy", threshold)
             print(f"  Global model serialized to {out_dir}/  [{mode_str}]")
-
-        # # Delete per-client checkpoints now that aggregation succeeded
-        # for client_id in range(k):
-        #     ckpt_dir = f"models/k={k}/class_{class_idx}/client_{client_id}"
-        #     if os.path.exists(ckpt_dir):
-        #         shutil.rmtree(ckpt_dir)
-        # print(f"  Intermediate checkpoints deleted.")
 
         classifiers_fed.append({"class_idx": class_idx, "scores": scores_fed})
         classifiers_single.append({"class_idx": class_idx, "scores": scores_s})

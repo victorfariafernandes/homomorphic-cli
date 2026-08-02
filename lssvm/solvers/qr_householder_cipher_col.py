@@ -35,11 +35,10 @@ from .utils import (
     slots_for_security,
 )
 
-# Bootstrap CoeffToSlot/SlotToCoeff level budget. MUST stay small enough for the sparse
-# 32-slot packing: with log2(32)=5 rotation stages, a (4,4) budget over-factorizes the
-# homomorphic FFT and OpenFHE silently returns garbage from every genuinely-executing
-# bootstrap (no exception). (3,2) validated at N=131072/HEStd_128_classic: max_rel_err
-# 8.8e-3 per genuine bootstrap. usable=25, bootdepth=19, total depth=44.
+# Bootstrap CoeffToSlot/SlotToCoeff level budget. Must stay small enough for the
+# sparse 32-slot packing (log2(32)=5 rotation stages): (4,4) over-factorizes the
+# homomorphic FFT and OpenFHE silently returns garbage (no exception). (3,2) is
+# validated at N=131072/HEStd_128_classic: max_rel_err 8.8e-3, usable=25, bootdepth=19.
 _BOOTSTRAP_LEVEL_BUDGET = (3, 2)
 _BOOTSTRAP_USABLE_DEPTH = 25
 # EvalBootstrap silently returns the input unchanged (after full compute cost) when the

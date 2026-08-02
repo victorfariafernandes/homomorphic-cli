@@ -10,7 +10,9 @@ test validates the measurement mechanism, not the headline figure.)
 import os
 
 import pytest
-from openfhe import SerializeToFile, BINARY
+
+openfhe = pytest.importorskip("openfhe", reason="requires the OpenFHE C++/Python build")
+SerializeToFile, BINARY = openfhe.SerializeToFile, openfhe.BINARY
 
 from config.report import measure_comm_bytes
 from federated_lssvm.baseline_run import _NOTSET_DEPTH

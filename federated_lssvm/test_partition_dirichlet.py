@@ -8,6 +8,8 @@ plaintext reference exercised here.
 import numpy as np
 import pytest
 
+pytest.importorskip("openfhe", reason="requires the OpenFHE C++/Python build")
+
 from federated_lssvm.train import partition_all, plaintext_federated_reference
 from lssvm.preprocessors import prepare_binary
 
@@ -98,11 +100,10 @@ def test_iid_default_is_class_stratified_balanced():
 
 # ── plaintext FedAvg oracle (real iris class-0, setosa vs rest) ─────────────
 
-# Use a real OvR sub-problem, not synthetic blobs: this LSSVM formulation
-# degenerates to w=0 on perfectly balanced/symmetric data, whereas real OvR
-# problems are imbalanced. setosa-vs-rest is linearly separable, so near-IID
+# Real OvR sub-problem, not synthetic blobs: this LSSVM degenerates to w=0 on
+# balanced/symmetric data. setosa-vs-rest is linearly separable, so near-IID
 # FedAvg reaches 100% and skew degrades it -- the reference the ciphertext test
-# is checked against. gamma=10 matches the light regularization the solver uses.
+# checks against. gamma=10 matches the solver's regularization.
 _ORACLE_GAMMA = 10.0
 
 

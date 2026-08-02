@@ -5,12 +5,9 @@ from __future__ import annotations
 import math
 import random
 
-# Slot width used for every plaintext/ciphertext touched by the bootstrapping
-# (security="128") path. Must be >= the largest rotation index ever used
-# against a bootstrapped ciphertext (n_test=30 for Iris, feature_dim<=15,
-# matrix_size<=7) -- validated empirically (see plan doc): EvalRotate wraps
-# around modulo the ciphertext's bootstrap num_slots with no error, so this
-# must stay >= max(n_test, feature_dim, matrix_size) for every caller.
+# Slot width for every plaintext/ciphertext on the bootstrapping (security="128")
+# path. EvalRotate wraps silently (no error) modulo the bootstrap num_slots, so
+# this must stay >= max(n_test, feature_dim, matrix_size) for every caller.
 SPARSE_BOOTSTRAP_SLOTS = 32
 
 

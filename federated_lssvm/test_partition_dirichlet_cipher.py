@@ -9,6 +9,8 @@ the encrypted path runs without the slow 128-bit bootstrap.
 import numpy as np
 import pytest
 
+pytest.importorskip("openfhe", reason="requires the OpenFHE C++/Python build")
+
 import federated_lssvm.train as T
 from federated_lssvm.baseline_run import _NOTSET_DEPTH
 from federated_lssvm.solver_selection import resolve_solver_module, DEFAULT_SOLVER_NAME
