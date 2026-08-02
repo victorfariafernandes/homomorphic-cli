@@ -231,7 +231,7 @@ def build_primal_augmented(
     recovered ``(b, w = Phi^T(alpha * y))`` -- same LSSVM problem, but the QR runs
     on an SPD normal-equations system so every pivot is bounded below by
     ``sqrt(lambda_min)`` and a fixed reflection sign is safe (no per-step data
-    simulation needed). See docs/superpowers/plans for the derivation.
+    simulation needed).
 
     The primal normal equations are ``H @ [b; w] = [sum(y); s]`` with
     ``H = [[N, p^T], [p, G + I/gamma]]``, ``G = Phi^T Phi``, ``p = Phi^T y``,

@@ -43,14 +43,11 @@ W="${W:-$(( W_MEM < NCPU ? W_MEM : NCPU ))}"
 THREADS="${THREADS:-$(( NCPU / W ))}"; (( THREADS < 1 )) && THREADS=1
 
 # ── Environment (pytest + aggregation need the venv; run_parallel.sh self-activates) ──
-if [ -f /opt/lssvm/venv/bin/activate ]; then
-    # shellcheck disable=SC1091
-    source /opt/lssvm/venv/bin/activate
-    export LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-elif [ -f "$REPO_ROOT/venv/bin/activate" ]; then
+if [ -f "$REPO_ROOT/venv/bin/activate" ]; then
     # shellcheck disable=SC1091
     source "$REPO_ROOT/venv/bin/activate"
 fi
+export LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export PYTHONPATH="$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 
 log() { echo "[campaign $(date -u +%H:%M:%S)] $*"; }

@@ -7,8 +7,6 @@ Least-Squares SVM training + inference over CKKS-encrypted data using OpenFHE. I
 - `lssvm/` — plaintext + ciphertext LSSVM, preprocessing, solvers
 - `federated_lssvm/` — multi-party training + inference
 - `config/` — run script, metrics, shared init helpers (parallel)
-- `infra/ansible/` — node provisioning, OpenFHE build
-- `infra/terraform/` — cloud resource provisioning
 - `requirements.txt`, `pytest.ini`, `activate_env.sh` — dev tooling
 
 ## Entry points
@@ -41,9 +39,41 @@ pip install -r requirements.txt
 pytest
 ```
 Tested on Python 3.11. `federated_lssvm/` tests that exercise the encrypted path
-require the OpenFHE C++/Python build (see Deploy below) and are skipped
-automatically when `openfhe` isn't importable — `pytest lssvm` alone runs on
-plain `numpy`/`scipy`/`scikit-learn`, no OpenFHE build needed.
+require the OpenFHE C++/Python build (see below) and are skipped automatically
+when `openfhe` isn't importable — `pytest lssvm` alone runs on plain
+`numpy`/`scipy`/`scikit-learn`, no OpenFHE build needed.
+
+## Building OpenFHE locally
+The encrypted path needs OpenFHE's C++ library and the `openfhe-python`
+bindings built from source (there is no working `openfhe` package on PyPI).
+
+```bash
+sudo apt install build-essential cmake git libssl-dev libomp-dev autoconf python3-dev python3-venv
+
+# 1. OpenFHE C++ core
+git clone --depth 1 --branch v1.5.1 https://github.com/openfheorg/openfhe-development.git /tmp/openfhe
+cmake -S /tmp/openfhe -B /tmp/openfhe/build -DBUILD_UNITTESTS=OFF -DBUILD_EXAMPLES=OFF \
+  -DBUILD_BENCHMARKS=OFF -DCMAKE_BUILD_TYPE=Release -DWITH_NATIVEOPT=ON -DWITH_OPENMP=ON
+cmake --build /tmp/openfhe/build -j"$(nproc)"
+sudo cmake --install /tmp/openfhe/build
+sudo ldconfig
+
+# 2. Python bindings (built into the venv from activate_env.sh)
+pip install pybind11
+git clone --depth 1 https://github.com/openfheorg/openfhe-python.git /tmp/openfhe-python
+cmake -S /tmp/openfhe-python -B /tmp/openfhe-python/build \
+  -DCMAKE_PREFIX_PATH="/usr/local;$(python -m pybind11 --cmakedir)" \
+  -Dpybind11_DIR="$(python -m pybind11 --cmakedir)" \
+  -DPYTHON_EXECUTABLE="$(which python)"
+cmake --build /tmp/openfhe-python/build -j"$(nproc)"
+cp /tmp/openfhe-python/build/openfhe*.so "$(python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
+
+export LD_LIBRARY_PATH=/usr/local/lib:${LD_LIBRARY_PATH:-}
+python -m config.omp_smoke   # PASS = OpenFHE is running parallel, FAIL = serial build
+```
+`WITH_OPENMP=ON` is required — without it OpenFHE runs single-threaded and every
+FHE worker rides one core. `LD_LIBRARY_PATH` must be set in every shell that
+imports `openfhe`.
 
 ## Reproducing results
 Quick sanity check, no OpenFHE build needed (seconds):
@@ -51,17 +81,17 @@ Quick sanity check, no OpenFHE build needed (seconds):
 pytest lssvm
 ```
 
-Full experiment suite (needs OpenFHE — build via `infra/ansible/site.yml`,
-locally with `inventory.local.ini` or on a cloud node per Deploy below):
+Full experiment suite (needs the OpenFHE build above):
 ```bash
 bash config/run_campaign.sh
 ```
 Sweeps iris + breast_cancer across IID and Dirichlet non-IID partitions
 (`alpha` in `{0.5, 0.05}`) at 128-bit security. Per-run metrics land in
 `campaign_results/<config>/report.md`, aggregated into
-`campaign_results/all_metrics.csv` and `campaign_results/SUMMARY.md`. Expect
-on the order of hours on a multi-core instance (see `infra/terraform` for the
-reference cloud shape).
+`campaign_results/all_metrics.csv` and `campaign_results/SUMMARY.md`. Sizes
+itself to the machine's core/RAM budget; expect on the order of hours on a
+modest multi-core machine. Worker logs live at `models/k=<K>/logs/worker_*.log`
+while a config runs, then move to `campaign_results/<config>/logs/` when done.
 
 Fast pipeline smoke test, minutes, insecure `notset` crypto params — validates
 the pipeline shape, not the reported accuracy/security numbers:
@@ -72,40 +102,6 @@ SECURITY=notset ALPHAS="0.5" bash config/run_campaign.sh
 All train/test splits use a fixed seed (`random_state=42`), so plaintext
 metrics reproduce exactly; encrypted-path numbers reproduce to CKKS's
 approximate-arithmetic tolerance.
-
-## Deploy
-```bash
-cd infra/terraform && terraform apply
-ansible-playbook -i ../ansible/inventory.oci.ini ../ansible/site.yml \
-	--extra-vars "repo_root=$PWD/../.."
-```
-
-Local-only smoke (no remote): use `infra/ansible/inventory.local.ini`.
-
-## Monitoring the campaign
-On the cloud node the `lssvm-campaign` systemd unit runs `config/run_campaign.sh`
-(pytest gate + the iris/breast_cancer × {iid, dirichlet} sweep). Set `IP`/`KEY` to the
-instance, then:
-
-```bash
-IP=<public-ip> ; KEY=~/.ssh/<key>
-
-# campaign progress (per-config OK/FAIL, pytest, sizing)
-ssh -i $KEY ubuntu@$IP 'tail -f /opt/lssvm/app/campaign_results/campaign.log'
-
-# ALL worker logs, live + completed, one header per worker
-ssh -i $KEY ubuntu@$IP '
-  find /opt/lssvm/app/models /opt/lssvm/app/campaign_results -name "worker_*.log" 2>/dev/null \
-    | sort | xargs -r tail -n +1 -v'
-
-# follow the CURRENTLY-running workers (re-run at each new config / k-dir)
-ssh -i $KEY ubuntu@$IP 'tail -n +1 -f /opt/lssvm/app/models/k=*/logs/worker_*.log'
-```
-
-Worker logs live at `models/k=<K>/logs/worker_*.log` while a config runs, then move to
-`campaign_results/<config>/logs/` when it finishes. Final artifacts (`all_metrics.csv`,
-`SUMMARY.md`, `campaign_results.tar.gz`) land in `campaign_results/`. To confirm OpenMP is
-actually engaging on the node: `python -m config.omp_smoke` (PASS = parallel, FAIL = serial).
 
 ## Conventions
 - package-per-concern, no flat scripts at root except `activate_env.sh`

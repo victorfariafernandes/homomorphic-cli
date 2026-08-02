@@ -1,6 +1,5 @@
 """Reported crypto parameters for the HEAAN-based baseline paper (R1 item 2,
-analytical comparison, WS4 — see docs/superpowers/specs/2026-07-29-r1-revision-
-campaign-design.md).
+analytical comparison).
 
 Values are exactly as reported in the paper's Section IV-B ("Experimental
 Settings") — nothing here is inferred beyond the depth derivation noted below.
