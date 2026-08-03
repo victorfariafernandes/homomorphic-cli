@@ -85,7 +85,12 @@ Os selos considerados são: Disponível (Selo D).
 - **openfhe-python** — bindings Python do OpenFHE, compilados a partir do
   código-fonte via `pybind11` (não há build pré-compilado publicado).
 - Ferramentas de build (Ubuntu/Debian): `build-essential cmake git
-  libssl-dev libomp-dev autoconf python3-dev python3-venv`.
+  libssl-dev libomp-dev autoconf python3.11 python3.11-venv python3.11-dev`.
+  Nem Ubuntu 22.04 (Python 3.10) nem 24.04 (Python 3.12) trazem Python 3.11
+  no repositório padrão — é necessário o PPA `deadsnakes`:
+  `sudo add-apt-repository ppa:deadsnakes/ppa` (requer também
+  `software-properties-common gnupg dirmngr ca-certificates` instalados
+  antes, caso ainda não estejam).
 - Nenhum dataset ou serviço de terceiros requer cadastro, chave de API ou
   autenticação — `iris` e `breast_cancer` são carregados diretamente do
   `scikit-learn`.
@@ -103,6 +108,7 @@ scikit-learn).
 ```bash
 git clone https://github.com/victorffernandes/homomorphic-cli.git
 cd homomorphic-cli
+python3.11 -m venv venv
 source activate_env.sh
 pip install -r requirements.txt
 ```
@@ -111,7 +117,9 @@ O caminho criptografado requer, adicionalmente, compilar o OpenFHE e seus
 bindings Python a partir do código-fonte:
 
 ```bash
-sudo apt install build-essential cmake git libssl-dev libomp-dev autoconf python3-dev python3-venv
+sudo apt install software-properties-common gnupg dirmngr ca-certificates
+sudo add-apt-repository -y ppa:deadsnakes/ppa
+sudo apt install build-essential cmake git libssl-dev libomp-dev autoconf python3.11 python3.11-venv python3.11-dev
 
 # 1. Núcleo C++ do OpenFHE
 git clone --depth 1 --branch v1.5.1 https://github.com/openfheorg/openfhe-development.git /tmp/openfhe
