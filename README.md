@@ -3,6 +3,15 @@
 ## Purpose
 Least-Squares SVM training + inference over CKKS-encrypted data using OpenFHE. Includes federated variant for multi-party training without sharing plaintext.
 
+## Selos considerados
+Selo D (Disponível).
+
+## Preocupações com segurança
+Nenhuma. A execução deste artefato (testes, build do OpenFHE, experimentos) não
+oferece risco aos avaliadores — não requer privilégios elevados além dos pacotes
+de build padrão (`apt install`), não acessa rede além de clonar dependências, e
+não processa dados sensíveis (usa apenas datasets públicos do scikit-learn).
+
 ## Layout
 - `lssvm/` — plaintext + ciphertext LSSVM, preprocessing, solvers
 - `federated_lssvm/` — multi-party training + inference
