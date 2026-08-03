@@ -1,0 +1,4 @@
+timestamp,dataset,k,class,approach,accuracy_pct,precision_pct,f1_pct,w_err,total_s
+2026-08-01T11:18:23Z,breast_cancer,40,0,Baseline (plaintext solve + encrypted agg),80.7,67.86,77.55,1.1298e-11,
+2026-08-01T11:18:23Z,breast_cancer,40,0,Federated plaintext reference,80.7,67.86,77.55,1.1298e-11,
+2026-08-01T11:18:23Z,breast_cancer,40,0,Full-data plaintext reference,95.61,97.44,93.83,1.1298e-11,

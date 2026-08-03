@@ -1,0 +1,13 @@
+timestamp,dataset,k,class,approach,accuracy_pct,precision_pct,f1_pct,w_err,total_s
+2026-08-02T23:31:13Z,iris,40,0,"Single-client FHE (N_per_class=2, seed=42)",96.67,100.0,94.74,1.4916e-05,9841.0
+2026-08-02T23:31:13Z,iris,40,0,Federated FHE  (40 clients avg.),100.0,100.0,100.0,1.4916e-05,9841.0
+2026-08-02T23:31:13Z,iris,40,0,Federated plaintext reference,100.0,100.0,100.0,1.4916e-05,9841.0
+2026-08-02T23:31:13Z,iris,40,0,Full-data plaintext reference,100.0,100.0,100.0,1.4916e-05,9841.0
+2026-08-02T23:31:13Z,iris,40,1,"Single-client FHE (N_per_class=2, seed=42)",33.33,33.33,50.0,5.6452e-06,9841.0
+2026-08-02T23:31:13Z,iris,40,1,Federated FHE  (40 clients avg.),83.33,66.67,80.0,5.6452e-06,9841.0
+2026-08-02T23:31:13Z,iris,40,1,Federated plaintext reference,83.33,66.67,80.0,5.6452e-06,9841.0
+2026-08-02T23:31:13Z,iris,40,1,Full-data plaintext reference,90.0,100.0,82.35,5.6452e-06,9841.0
+2026-08-02T23:31:13Z,iris,40,2,"Single-client FHE (N_per_class=2, seed=42)",33.33,0.0,0.0,6.7182e-06,9841.0
+2026-08-02T23:31:13Z,iris,40,2,Federated FHE  (40 clients avg.),73.33,56.25,69.23,6.7182e-06,9841.0
+2026-08-02T23:31:13Z,iris,40,2,Federated plaintext reference,73.33,56.25,69.23,6.7182e-06,9841.0
+2026-08-02T23:31:13Z,iris,40,2,Full-data plaintext reference,90.0,100.0,82.35,6.7182e-06,9841.0

@@ -1,0 +1,5 @@
+timestamp,dataset,k,class,approach,accuracy_pct,precision_pct,f1_pct,w_err,total_s
+2026-08-03T08:36:30Z,breast_cancer,225,0,"Single-client FHE (N_per_class=2, seed=42)",37.72,28.36,34.86,0.00028973,12830.0
+2026-08-03T08:36:30Z,breast_cancer,225,0,Federated FHE  (225 clients avg.),89.47,84.09,86.05,0.00028973,12830.0
+2026-08-03T08:36:30Z,breast_cancer,225,0,Federated plaintext reference,89.47,84.09,86.05,0.00028973,12830.0
+2026-08-03T08:36:30Z,breast_cancer,225,0,Full-data plaintext reference,79.82,100.0,62.3,0.00028973,12830.0
