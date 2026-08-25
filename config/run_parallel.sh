@@ -36,12 +36,12 @@ if [ -n "${OMP_WAIT_POLICY:-}" ]; then
     export OMP_WAIT_POLICY
 fi
 
-# Cloud node layout (infra/ansible/site.yml): venv + native libs.
-if [ -f /opt/lssvm/venv/bin/activate ]; then
+# Local venv (see activate_env.sh) + OpenFHE native libs.
+if [ -f "$REPO_ROOT/venv/bin/activate" ]; then
     # shellcheck disable=SC1091
-    source /opt/lssvm/venv/bin/activate
-    export LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+    source "$REPO_ROOT/venv/bin/activate"
 fi
+export LD_LIBRARY_PATH="/usr/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 NCPU=$(nproc 2>/dev/null || sysctl -n hw.ncpu)
 TOTAL=$((W * THREADS))

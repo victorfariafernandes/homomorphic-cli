@@ -73,6 +73,10 @@ solv = None
 D_SQRT = 8
 D_INV = 8
 D_INV_BACKSUB = 8
+# Caps a Dirichlet-partitioned client's total sample count so max_client_n can't
+# exceed 5 (4 samples + 1 bias row) -- the exact size already proven safe (5
+# workers, 4+ hours, breast_cancer k=150 iid). See _cap_client_sizes().
+MAX_DIRICHLET_CLIENT_SIZE = 4
 DEPTH_SAFETY = 1.20
 DEPTH_OVERRIDE = None
 N_OVERRIDE = None
@@ -293,6 +297,51 @@ def _subsample_for_fhe(
 # ── core federated functions ────────────────────────────────────────
 
 
+def _cap_client_sizes(client_idx: list[np.ndarray], max_size: int, rng) -> list[np.ndarray]:
+    """Trim any client above max_size, redistributing overflow round-robin to
+    clients with spare capacity.
+
+    Dirichlet skew can otherwise put an unbounded number of samples on one
+    client, ballooning max_client_n (and with it the FHE multiplicative depth
+    and crypto context's ring dimension/memory) far past what iid partitioning
+    at the same k needs -- this crashed the run (OOM) at depth=297 vs iid's
+    depth=172 for the same dataset/k. Capping keeps every client's matrix size
+    within a depth budget already proven safe, without dropping any sample
+    (preserves partition_all's disjoint-and-complete invariant).
+    """
+    # Never cap below what's needed to hold every sample under a uniform
+    # allocation -- otherwise k*max_size < total and redistribution below would
+    # have nowhere to put the overflow, silently dropping data. The cap only
+    # ever reduces *skew*-driven over-allocation, never forces data loss.
+    total = sum(len(c) for c in client_idx)
+    k = len(client_idx)
+    max_size = max(max_size, -(-total // k))  # ceil division
+
+    client_idx = [c.copy() for c in client_idx]
+    overflow = []
+    for i, c in enumerate(client_idx):
+        if len(c) > max_size:
+            overflow.append(c[max_size:])
+            client_idx[i] = c[:max_size]
+    if not overflow:
+        return client_idx
+    pool = np.concatenate(overflow)
+    rng.shuffle(pool)
+    order = list(range(len(client_idx)))
+    pos = 0
+    while pos < len(pool):
+        progressed = False
+        rng.shuffle(order)
+        for i in order:
+            if len(client_idx[i]) < max_size and pos < len(pool):
+                client_idx[i] = np.append(client_idx[i], pool[pos])
+                pos += 1
+                progressed = True
+        if not progressed:
+            break  # every client at cap; only possible if k*max_size < total samples
+    return client_idx
+
+
 def _dirichlet_split(idx: np.ndarray, k: int, alpha: float, rng) -> list[np.ndarray]:
     """Allocate `idx` across k clients by Dirichlet(alpha) proportions.
 
@@ -353,6 +402,9 @@ def partition_all(
     client_idx = [
         np.concatenate([pos_chunks[i], neg_chunks[i]]).astype(int) for i in range(k)
     ]
+
+    if partition == "dirichlet":
+        client_idx = _cap_client_sizes(client_idx, MAX_DIRICHLET_CLIENT_SIZE, rng)
 
     # Guard: no fully-empty client (would break the downstream FHE matrix build).
     empties = [i for i in range(k) if len(client_idx[i]) == 0]
@@ -434,8 +486,20 @@ def plaintext_federated_reference(
     partitions_feat: list[tuple[np.ndarray, np.ndarray]],
     X_te_feat: np.ndarray,
     gamma: float,
+    X_tr_feat: np.ndarray | None = None,
+    y_tr: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, float]:
     """Compute FedAvg in plaintext numpy for validation.
+
+    X_tr_feat/y_tr, if given, recalibrate the decision threshold the same way
+    the FHE path does (recalibration_threshold on this model's own training
+    scores) -- without it, sign(score) uses an uncentred threshold=0, which
+    this solver's KKT variant only gets right for balanced classes (see
+    recalibration_threshold's docstring). Skipping this made "Federated
+    plaintext reference" wildly diverge from "Federated FHE" on imbalanced
+    problems (breast_cancer: 64% vs 91% accuracy) despite near-identical
+    weights (~1e-4 relative error) -- both rows must apply the same threshold
+    to actually be comparable.
 
     Returns (predictions, w_avg, b_avg).
     """
@@ -449,7 +513,13 @@ def plaintext_federated_reference(
     k = len(partitions_feat)
     w_avg = w_sum / k
     b_avg = b_sum / k
-    scores = X_te_feat @ w_avg + b_avg
+
+    threshold = 0.0
+    if X_tr_feat is not None and y_tr is not None:
+        train_scores = X_tr_feat @ w_avg + b_avg
+        threshold = recalibration_threshold(train_scores, y_tr)
+
+    scores = X_te_feat @ w_avg + b_avg - threshold
     preds = np.sign(scores)
     preds[preds == 0] = 1.0
     return preds, w_avg, b_avg
@@ -974,7 +1044,7 @@ def main(
 
         # Plaintext federated reference
         preds_plain_fed, w_plain_fed, _ = plaintext_federated_reference(
-            parts_feat, X_te_feat, gamma
+            parts_feat, X_te_feat, gamma, X_tr_feat=X_tr_feat, y_tr=y_tr
         )
 
         # Single-client FHE baseline (matches lssvm/cipher.py, N_PER_CLASS=2).
@@ -1035,9 +1105,15 @@ def main(
 
     def _ovr_acc(classifiers):
         if len(classifiers) == 1:
+            # Binary case: preds are +-1 (this pipeline's label convention), but
+            # y_test_raw is sklearn's raw {0,1} integer target -- comparing them
+            # directly silently mismatches label spaces (e.g. produced 5.26%
+            # instead of the true ~91% for breast_cancer). y_te here is the
+            # +-1-encoded test label array from the single (only) splits loop
+            # iteration above, in the same convention as preds.
             preds = np.sign(classifiers[0]["scores"])
             preds[preds == 0] = 1.0
-            return float(np.mean(preds == y_test_raw) * 100)
+            return float(np.mean(preds == y_te) * 100)
         score_matrix = np.column_stack([c["scores"] for c in classifiers])
         class_indices = np.array([c["class_idx"] for c in classifiers])
         predicted = class_indices[score_matrix.argmax(axis=1)]

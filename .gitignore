@@ -1,23 +1,12 @@
+# Local-only cloud infra (removed from tracking on this branch; leftover
+# terraform state must never be committed)
+infra/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
-
-# Terraform state + locals
-infra/terraform/variables/*
-infra/terraform/.terraform
-infra/terraform/terraform.tfstate
-infra/terraform/terraform.tfstate.backup
-infra/terraform/.terraform.lock.hcl
-*.tfvars
-!*.tfvars.example
-
-# Ansible artifacts
-infra/ansible/inventory.ini
-infra/ansible/.ansible/
-infra/ansible/collections/
-*.retry
 
 # Distribution / packaging
 build/
