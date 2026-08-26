@@ -981,9 +981,17 @@ def main(
         except np.linalg.LinAlgError:
             sol_full = np.linalg.lstsq(H_full, rhs_full, rcond=None)[0]
         alpha_full = sol_full[1:]
-        preds_plain_full, _ = predict_lssvm(
+        # Recalibrate like the three rows above (mirrors plain_run.py): an
+        # uncalibrated sign(score) understates accuracy on imbalanced OvR classes.
+        _, train_scores_full = predict_lssvm(
+            X_tr_feat, X_tr_feat, alpha_full, y_tr, sol_full[0]
+        )
+        thr_full = recalibration_threshold(train_scores_full, y_tr)
+        _, scores_full = predict_lssvm(
             X_te_feat, X_tr_feat, alpha_full, y_tr, sol_full[0]
         )
+        preds_plain_full = np.sign(scores_full - thr_full)
+        preds_plain_full[preds_plain_full == 0] = 1.0
 
         # Per-client FHE training (with checkpointing)
         parts = all_partitions[class_idx]

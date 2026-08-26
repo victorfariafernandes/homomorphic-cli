@@ -23,7 +23,7 @@ FHE vs plaintext federated weights rel. error: 4.5858e-05
 | Single-client FHE (N_per_class=2, seed=42) | 33.33% | 33.33% | 50.00% |
 | Federated FHE  (80 clients avg.) | 90.00% | 76.92% | 86.96% |
 | Federated plaintext reference | 90.00% | 76.92% | 86.96% |
-| Full-data plaintext reference | 90.00% | 100.00% | 82.35% |
+| Full-data plaintext reference | 93.33% | 83.33% | 90.91% |
 
 FHE vs plaintext federated weights rel. error: 9.1538e-06
 
@@ -34,7 +34,7 @@ FHE vs plaintext federated weights rel. error: 9.1538e-06
 | Single-client FHE (N_per_class=2, seed=42) | 33.33% | 0.00% | 0.00% |
 | Federated FHE  (80 clients avg.) | 73.33% | 55.56% | 71.43% |
 | Federated plaintext reference | 73.33% | 55.56% | 71.43% |
-| Full-data plaintext reference | 90.00% | 100.00% | 82.35% |
+| Full-data plaintext reference | 96.67% | 90.91% | 95.24% |
 
 FHE vs plaintext federated weights rel. error: 1.3137e-05
 
