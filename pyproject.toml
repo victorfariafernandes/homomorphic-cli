@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "federated-lssvm-fhe"
+version = "0.1.0"
+description = "Federated LS-SVM training over CKKS homomorphic encryption (OpenFHE)"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+# OpenFHE + openfhe-python are C++ builds, not pip packages — see README.
+dependencies = [
+    "numpy==2.1.3",
+    "scipy==1.16.3",
+    "scikit-learn==1.8.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.0.1",
+    "pytest-cov==7.0.0",
+    "ruff",
+]
+
+[tool.setuptools.packages.find]
+include = ["lssvm*", "federated_lssvm*", "config*"]
+namespaces = true
+
+[tool.pytest.ini_options]
+minversion = "6.0"
+addopts = "-ra -q --tb=short"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 102
+target-version = "py311"
+extend-exclude = ["venv", "experiments", "infra", "paper_results"]
+
+[tool.ruff.lint]
+# Same rule families flake8 checked (pycodestyle + pyflakes).
+select = ["E", "W", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+# OMP/thread setup (or pytest.importorskip) must run before the openfhe imports.
+"lssvm/cipher.py" = ["E402"]
+"federated_lssvm/train.py" = ["E402"]
+"federated_lssvm/infer.py" = ["E402"]
+"federated_lssvm/worker.py" = ["E402"]
+"federated_lssvm/baseline_run.py" = ["E402"]
+"tests/federated_lssvm/test_comm_bytes_cipher.py" = ["E402"]

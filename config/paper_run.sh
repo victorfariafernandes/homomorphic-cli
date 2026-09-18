@@ -6,5 +6,4 @@
 #
 # For a fast, non-secure pipeline smoke test instead, see the README.
 set -euo pipefail
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec bash "$REPO_ROOT/config/run_campaign.sh" "$@"
+exec bash "$(dirname "${BASH_SOURCE[0]}")/run_campaign.sh" "$@"

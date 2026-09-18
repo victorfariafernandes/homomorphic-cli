@@ -24,31 +24,55 @@ dimensionalidade, comparação analítica com métodos iterativos de HE,
 escalabilidade e robustez sob distribuições não-IID entre clientes via
 particionamento de Dirichlet).
 
-# Estrutura do readme.md
+# Estrutura do repositório
 
-Este repositório está organizado da seguinte forma:
+```
+.
+├── README.md, LICENSE, CITATION.cff
+├── pyproject.toml          # dependências (pip install -e ".[dev]"), config do pytest e do ruff
+├── activate_env.sh         # ativa o venv/ do projeto
+├── lssvm/                  # LSSVM em texto claro + criptografado (CKKS/OpenFHE)
+│   ├── preprocessors/      # carga/split/escala por dataset (iris, breast_cancer)
+│   └── solvers/            # solvers criptografados (CG, QR-Householder)
+├── federated_lssvm/        # treinamento + inferência multi-parte (FedAvg sobre CKKS)
+├── config/                 # scripts de execução, métricas e helpers de inicialização
+├── tests/                  # testes pytest, espelhando lssvm/ e federated_lssvm/
+└── paper_results/          # relatórios e métricas dos experimentos do artigo
+```
 
-- `lssvm/` — LSSVM em texto claro + criptografado, pré-processamento, solvers
-- `federated_lssvm/` — treinamento + inferência multi-parte (FedAvg sobre CKKS)
-- `config/` — script de execução, métricas, helpers compartilhados de inicialização (paralelismo)
-- `paper_results/` — relatórios (`*_report.md`) e métricas (`*_metrics.csv`) dos experimentos reportados no artigo, um par de arquivos por configuração (dataset × k × partição)
-- `requirements.txt`, `pytest.ini`, `activate_env.sh` — ferramentas de desenvolvimento
-- `paper_run.sh` — reproduz os resultados reportados no artigo
+`lssvm/` — núcleo LSSVM:
+- `plain.py` — referência de LSSVM em texto claro
+- `cipher.py` — LSSVM criptografado com CKKS
+- `preprocessing.py` — normalização de features, preparo de kernel, montagem do sistema linear
+- `preprocessors/` — `base.py` (split/escala/binarização comuns) e um sub-pacote por dataset (`iris/`, `breast_cancer/`) expondo `prepare_binary(...)`
+- `qr_householder.py` — referência em texto claro do QR-Householder
+- `inference.py` — motor de inferência criptografada
+- `solvers/cg_cipher.py` — solver de Gradiente Conjugado, LHS/RHS criptografados
+- `solvers/qr_householder_cipher_{col,row}.py` — variantes do QR-Householder com diferentes trade-offs entre profundidade multiplicativa e empacotamento de slots
+- `solvers/_solver_common.py` — contexto CKKS, chaves de rotação, serialização de modelo/checkpoint e predição, compartilhados pelos solvers QR
+- `solvers/utils.py` — helpers de rotação/máscara e simulações em texto claro (normas, sinais) usados pelos solvers
+- Solvers federados com suporte a checkpoint (`--solver=`): `cg`, `qr_row` (padrão), `qr_col`
 
-Módulos principais:
-- `lssvm/plain.py` — referência de LSSVM em texto claro
-- `lssvm/cipher.py` — LSSVM criptografado com CKKS
-- `lssvm/preprocessing.py` — normalização de features, preparo de kernel
-- `lssvm/qr_householder.py` — referência em texto claro do QR-Householder
-- `lssvm/inference.py` — motor de inferência criptografada
-- `lssvm/solvers/cg_cipher.py` — solver de Gradiente Conjugado, LHS/RHS criptografados
-- `lssvm/solvers/qr_householder_cipher_{col,row}.py` — variantes do QR-Householder com diferentes trade-offs entre profundidade multiplicativa e empacotamento de slots
-- Solvers federados com suporte a checkpoint: `cg`, `qr_row`, `qr_col`
-- `lssvm/solvers/utils.py` — helpers de rotação/máscara compartilhados entre solvers
-- `federated_lssvm/train.py` — driver de treinamento multi-parte
-- `federated_lssvm/infer.py` — inferência federada
-- `config/parallel.py` — inicialização de threads/OpenMP
-- `config/metrics.py` — coleta de acurácia e tempo de execução
+`federated_lssvm/` — pipeline federado:
+- `train.py` — driver de treinamento multi-parte (k clientes, FedAvg, checkpoints)
+- `worker.py` — pool de workers paralelos (fork) sobre os solves por cliente
+- `baseline_run.py` — baseline de um único cliente com os parâmetros de segurança do artigo
+- `plain_run.py` — mesmo pipeline federado, inteiramente em texto claro (oráculo)
+- `infer.py` — inferência federada a partir dos modelos serializados
+- `solver_selection.py` — parsing das flags `--solver`, `--partition`, `--alpha`, `--models-root`
+
+`config/` — execução e métricas:
+- `paper_run.sh` — reproduz os resultados reportados no artigo (wrapper de `run_campaign.sh`)
+- `run_campaign.sh` — campanha completa: iris + breast_cancer, IID e Dirichlet, 128 bits
+- `run_parallel.sh` — um experimento: prepara contexto → W workers → finalize (agrega + avalia)
+- `run.sh` — executa um módulo Python com o venv e threads configurados
+- `parallel.py` — inicialização de threads/OpenMP
+- `metrics.py` — coleta de acurácia e tempo de execução
+- `report.py` — gera `report.md`/`metrics.csv` a partir dos logs de uma execução
+- `baseline_security_params.py` — parâmetros CKKS de referência do artigo (Seção IV-B)
+- `omp_smoke.py` — verifica se o build do OpenFHE está usando OpenMP
+
+`tests/` — `pytest` (ver "Teste mínimo"); `paper_results/` — um par `*_report.md` / `*_metrics.csv` por configuração (dataset × k × partição).
 
 # Selos Considerados
 
@@ -76,9 +100,9 @@ Os selos considerados são: Disponível (Selo D).
 
 # Dependências
 
-- **Python 3.11**, com as dependências fixadas em `requirements.txt`:
-  `numpy==2.1.3`, `scipy==1.16.3`, `scikit-learn==1.8.0`, `pytest==9.0.1`,
-  `pytest-cov==7.0.0`.
+- **Python 3.11**, com as dependências fixadas em `pyproject.toml`:
+  `numpy==2.1.3`, `scipy==1.16.3`, `scikit-learn==1.8.0`; extras de
+  desenvolvimento (`[dev]`): `pytest==9.0.1`, `pytest-cov==7.0.0`, `ruff`.
 - **OpenFHE** (núcleo C++), branch `v1.5.1`, compilado com
   `-DWITH_OPENMP=ON` (obrigatório — sem essa flag o OpenFHE roda em thread
   única).
@@ -110,7 +134,7 @@ git clone https://github.com/victorffernandes/homomorphic-cli.git
 cd homomorphic-cli
 python3.11 -m venv venv
 source activate_env.sh
-pip install -r requirements.txt
+pip install -e ".[dev]"
 ```
 
 O caminho criptografado requer, adicionalmente, compilar o OpenFHE e seus
@@ -153,7 +177,7 @@ Verificação rápida de sanidade, **sem** necessidade do build do OpenFHE
 (executa em segundos, usa apenas o caminho em texto claro):
 
 ```bash
-pytest lssvm
+pytest tests/lssvm
 ```
 
 Verificação mínima do caminho criptografado (requer o build do OpenFHE
@@ -161,7 +185,7 @@ concluído), poucos minutos, com parâmetros criptográficos inseguros
 (`notset`) apenas para validar a forma do pipeline:
 
 ```bash
-pytest federated_lssvm
+pytest tests/federated_lssvm
 ```
 
 # Experimentos
@@ -262,7 +286,24 @@ bash config/run_parallel.sh 225 5 2 --dataset=breast_cancer --security=notset --
     `breast_cancer_k225_iid`); erro relativo dos pesos ~2,4–2,9×10⁻⁴ em
     todas as configurações.
 
-# LICENSE
+# Licença
 
-MIT — veja o arquivo `LICENSE`. Se você usar este código, cite-o via
-`CITATION.cff`.
+Este projeto é distribuído sob a licença **MIT** — veja [`LICENSE`](LICENSE).
+
+# Como citar
+
+Os metadados de citação estão em [`CITATION.cff`](CITATION.cff) (o GitHub
+exibe o botão "Cite this repository" a partir dele). Equivalente em BibTeX:
+
+```bibtex
+@software{fernandes2026lssvm_fhe,
+  author     = {Fernandes, Victor Faria},
+  title      = {lwe: Privacy-Preserving LSSVM via Homomorphic Encryption (CKKS/OpenFHE)},
+  year       = {2026},
+  license    = {MIT},
+  url        = {https://github.com/victorffernandes/homomorphic-cli},
+  note       = {Least-squares SVM training and inference over CKKS-encrypted data
+                using OpenFHE, including a federated variant (FedAvg) for
+                multi-party training without sharing plaintext.}
+}
+```

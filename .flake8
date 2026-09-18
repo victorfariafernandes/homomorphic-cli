@@ -1,7 +1,0 @@
-[flake8]
-max-line-length = 102
-exclude = .git,__pycache__,docs/source/conf.py,old,build,dist
-per-file-ignores =
-    lssvm/cipher.py:E402
-    federated_lssvm/train.py:E402
-    federated_lssvm/infer.py:E402

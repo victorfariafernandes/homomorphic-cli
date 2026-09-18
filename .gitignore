@@ -28,11 +28,14 @@ venv/
 env/
 
 # Editors / OS
-.vscode/settings.json
-.vscode/launch.json
+.vscode/
 .idea/
 .DS_Store
 Thumbs.db
+
+# AI tooling / CI
+.claude/
+.github/
 
 # Temporary / backup
 *~
@@ -51,6 +54,7 @@ logs/
 # Models / data
 models/
 models_*/
+experiments/
 artifacts/
 data/
 datasets/

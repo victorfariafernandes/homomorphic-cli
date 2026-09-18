@@ -63,7 +63,7 @@ log "datasets: iris(k=$K_IRIS) breast_cancer(k=$K_BC)  alphas: ${ALPHAS[*]}"
 # oversubscribes all cores and those tests crawl for many minutes — they must never
 # block the actual metrics runs (which the campaign runs anyway, with controlled
 # threading). Threads pinned to 1 (tiny inputs) + a hard timeout as a backstop.
-GATE_TESTS="federated_lssvm/test_partition_dirichlet.py federated_lssvm/test_solver_selection.py federated_lssvm/test_run_report.py federated_lssvm/test_comm_bytes.py"
+GATE_TESTS="tests/federated_lssvm/test_partition_dirichlet.py tests/federated_lssvm/test_solver_selection.py tests/federated_lssvm/test_run_report.py tests/federated_lssvm/test_comm_bytes.py"
 command -v timeout >/dev/null && TO="timeout 300" || TO=""
 log "pytest (fast plaintext gate) ..."
 if env OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 \
